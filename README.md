@@ -86,9 +86,6 @@ This plugin is built for use with:
 
 This project is open source. Please ensure compliance with your local laws and organizational policies when using network scanning tools.
 
-## Contributing
-
-Feel free to submit issues and pull requests to improve this plugin.
 
 ---
 
