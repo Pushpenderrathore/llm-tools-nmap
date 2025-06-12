@@ -2,6 +2,8 @@
 
 A plugin for [Simon Willison's LLM](https://llm.datasette.io/) tool that provides Nmap network scanning capabilities through function calling. This plugin enables LLMs to perform network discovery and security scanning tasks using the powerful Nmap tool.
 
+Head over to our blog for [a full write up](https://hackertarget.com/llm-command-line-nmap/) of the experiment.
+
 ## Features
 
 - **Network Discovery**: Get local network information and suggested scan ranges
