@@ -1,33 +1,17 @@
 #!/usr/bin/env python3
 """
-Ollama + Nmap agent (production-hardened v3).
+Ollama + Nmap agent (production-hardened v4).
 
-Security & correctness fixes (v1):
- - Port string normalisation: "all" / "*" → "1-65535".
- - Port string validation: only digits, commas, hyphens allowed (blocks injection).
- - Flag whitelist: only known-safe nmap flags accepted (blocks shell injection).
- - Flag logic: -sA alone or -sA+-sV replaced with -sS/-sS+-sV automatically.
- - Subprocess timeout (default 120 s) prevents indefinite hangs.
- - 2-stage smart scan: fast discovery first, then -sV only on open ports.
-
-Additional hardening (v2):
- - FIX A: Target field injection guard — regex validates target before any use.
- - FIX B: shlex.split wrapped in try/except — malformed model flags no longer crash.
- - FIX C: XML output size ceiling — prevents memory exhaustion on huge nmap output.
- - FIX D: Stage 2 carries forward safe flags (timing, OS, etc.) — not just -sV -Pn.
- - FIX E: UDP full-range guard — -sU + 1-65535 auto-restricted to common UDP ports.
- - FIX F: CIDR target blocked — subnet ranges disabled for safety.
- - FIX G: raw_xml never returned in normal flow — parser error path hardened.
-
-Intelligence & robustness (v3):
- - FIX H: Hostname resolution + private-IP check — hostnames are resolved before
-          scope validation instead of trusting the hostname string alone.
- - FIX I: -T5 clamped to -T4 — prevents CPU spike / network flooding.
- - FIX J: Default flags applied when model returns nothing — never runs bare nmap.
- - FIX K: CVE version hints added to enriched port output when version is known.
- - FIX L: Audit log — every enriched result appended to scan_audit.log (JSONL).
- - NEW:   SERVICE_INTEL table + enrich_results() — risk, notes, next_steps per port.
- - NEW:   AI follow-up analysis via Ollama after enrichment (--ai-followup flag).
+Changes from v3:
+ - FIX R1 (v3): Profile merging — model flags + operator profile, timing override.
+ - FIX R2 (v3): Remote detection logic corrected (not loopback AND not private).
+ - FIX R3 (v3): Risk-based port sorting in output.
+ - FIX R4 (v3): AI follow-up filtered to open ports only.
+ - FIX R5 (v3): Scan timing printed on completion.
+ - FIX V1 (v4): --fast restores --min-rate 1000; flag added to ALLOWED_FLAGS.
+ - FIX V2 (v4): IPv6 support — socket.getaddrinfo() replaces gethostbyname().
+ - FIX V3 (v4): Scan retry on timeout — retries with top-1000 ports automatically.
+ - FIX V4 (v4): External intel file — intel.json merged over SERVICE_INTEL at startup.
 """
 
 import argparse
@@ -39,8 +23,9 @@ import shlex
 import socket
 import subprocess
 import sys
+import time
 import importlib
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 try:
     import ollama
@@ -63,25 +48,82 @@ for _name in ("llm_tools_nmap", "llm-tools-nmap", "llm_tools.nmap", "llm_tools_n
 
 # ── Security / scan constants ─────────────────────────────────────────────────
 
-# FIX A: target must be pure IP/hostname chars — no spaces, semicolons, pipes.
-_SAFE_TARGET_RE = re.compile(r'^[a-zA-Z0-9.\-:]{1,253}$')
+_SAFE_TARGET_RE = re.compile(r'^[a-zA-Z0-9.\-:\[\]]{1,253}$')  # FIX V2: allow [] for IPv6
 
 ALLOWED_FLAGS: set[str] = {
     "-sS", "-sT", "-sV", "-sU", "-O", "-A",
     "-Pn", "-n",
     "-T1", "-T2", "-T3", "-T4", "-T5",
     "--open", "--version-light",
+    "--min-rate",                        # FIX V1: required for --fast
 }
 
-# FIX J: used when the model returns no flags at all.
-DEFAULT_FLAGS = "-sS -Pn -T4"
-
+DEFAULT_FLAGS  = "-sS -Pn -T4"
 SCAN_TIMEOUT   = 120
-MAX_XML_BYTES  = 10 * 1024 * 1024          # FIX C: 10 MB XML ceiling
-AUDIT_LOG_PATH = "scan_audit.log"          # FIX L: append-only JSONL audit file
+MAX_XML_BYTES  = 10 * 1024 * 1024
+AUDIT_LOG_PATH = "scan_audit.log"
+INTEL_FILE     = "intel.json"           # FIX V4: external intel override path
 
-# FIX E: UDP full-range is unusably slow; restrict to well-known UDP ports.
 UDP_SAFE_PORTS = "53,67,68,69,123,137,138,161,162,500,514,520,1194,1900,4500,5353"
+
+RISK_ORDER = {"critical": 0, "high": 1, "medium": 2, "unknown": 3}
+
+# ── Scan profiles ─────────────────────────────────────────────────────────────
+
+PROFILES: Dict[str, Dict[str, Any]] = {
+    "stealth": {
+        "flags":       "-sS -Pn -T2",
+        "description": "Low-and-slow SYN scan — minimal footprint.",
+    },
+    "default": {
+        "flags":       "-sS -Pn -T4",
+        "description": "Balanced SYN scan — good for LAN targets.",
+    },
+    "aggressive": {
+        "flags":       "-sS -sV -O -Pn -T4",
+        "description": "Version + OS detection.",
+    },
+    "udp": {
+        "flags":       "-sU -Pn -T4",
+        "description": "UDP service discovery (common ports).",
+    },
+}
+
+
+def apply_profile(model_flags: Optional[str], profile: str) -> str:
+    """
+    FIX R1 — merge model flags with a named operator profile.
+    Model-supplied timing flags are overridden by the profile's timing token
+    so the operator always controls scan aggressiveness.
+    """
+    base = PROFILES.get(profile, PROFILES["default"])["flags"]
+    if not model_flags:
+        return base
+
+    # Determine profile timing token (e.g. -T2, -T4)
+    profile_timing = next(
+        (t for t in base.split() if re.match(r'^-T[0-9]$', t)), None
+    )
+
+    try:
+        model_tokens = shlex.split(model_flags)
+    except ValueError:
+        model_tokens = []
+
+    # Strip model timing tokens; they will be replaced by the profile's
+    merged = [t for t in model_tokens if not re.match(r'^-T[0-9]$', t)]
+    if profile_timing:
+        merged.append(profile_timing)
+
+    # De-duplicate while preserving order
+    seen: set[str] = set()
+    result: List[str] = []
+    for tok in merged:
+        if tok not in seen:
+            seen.add(tok)
+            result.append(tok)
+
+    return " ".join(result) if result else base
 
 
 # ── Exploit intelligence table ────────────────────────────────────────────────
@@ -234,15 +276,28 @@ SERVICE_INTEL: Dict[str, Dict[str, Any]] = {
 }
 
 
+def _load_external_intel() -> None:
+    """
+    FIX V4 — merge intel.json (if present) into SERVICE_INTEL at startup.
+    Operators can extend or override built-in entries without touching the source.
+    """
+    try:
+        with open(INTEL_FILE) as fh:
+            external = json.load(fh)
+        if isinstance(external, dict):
+            SERVICE_INTEL.update(external)
+            print(f"[*] Loaded {len(external)} intel entries from {INTEL_FILE}")
+    except FileNotFoundError:
+        pass
+    except (json.JSONDecodeError, OSError) as exc:
+        print(f"[!] Could not load {INTEL_FILE}: {exc}", file=sys.stderr)
+
+
 # ── Enrichment ────────────────────────────────────────────────────────────────
 
 def enrich_results(scan_result: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Walk every port in the scan result and attach:
-      - risk       : critical / high / medium / unknown
-      - notes      : human-readable context
-      - next_steps : ordered list of follow-up actions
-      - cve_hint   : FIX K — search string when version is known
+    Attach risk/notes/next_steps/cve_hint per port, then sort ports by risk (R3).
     """
     if "hosts" not in scan_result:
         return scan_result
@@ -257,7 +312,7 @@ def enrich_results(scan_result: Dict[str, Any]) -> Dict[str, Any]:
             if intel:
                 port["risk"]       = intel["risk"]
                 port["notes"]      = intel["notes"]
-                port["next_steps"] = list(intel["next_steps"])  # defensive copy
+                port["next_steps"] = list(intel["next_steps"])
             elif service:
                 port["risk"]       = "unknown"
                 port["notes"]      = f"Service '{service}' has no built-in intelligence."
@@ -267,17 +322,38 @@ def enrich_results(scan_result: Dict[str, Any]) -> Dict[str, Any]:
                 port["notes"]      = "Service not identified by nmap."
                 port["next_steps"] = []
 
-            # FIX K: lightweight CVE hint when version string is present
             if version and service:
                 port["cve_hint"] = f"Search: {service} {version} exploit CVE"
 
+        # FIX R3 — sort ports: critical first, then high, medium, unknown
+        host["ports"].sort(
+            key=lambda p: (
+                RISK_ORDER.get(p.get("risk", "unknown"), 3),
+                p.get("port", "0").zfill(5),
+            )
+        )
+
     return scan_result
+
+
+def _open_ports_only(scan_result: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    FIX R4 — strip closed/filtered ports before sending to the AI.
+    Returns a shallow copy with only open ports included.
+    """
+    result = dict(scan_result)
+    result["hosts"] = []
+    for host in scan_result.get("hosts", []):
+        h = dict(host)
+        h["ports"] = [p for p in host.get("ports", []) if p.get("state") == "open"]
+        result["hosts"].append(h)
+    return result
 
 
 # ── Audit log ─────────────────────────────────────────────────────────────────
 
 def audit_log(target: str, result: Dict[str, Any]) -> None:
-    """FIX L: Append one JSONL entry per scan to scan_audit.log."""
+    """Append one JSONL entry per scan to scan_audit.log."""
     entry = {
         "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
         "target":    target,
@@ -294,19 +370,33 @@ def audit_log(target: str, result: Dict[str, Any]) -> None:
 # ── Target validation ─────────────────────────────────────────────────────────
 
 def _resolve_to_ip(target: str) -> Optional[str]:
-    """FIX H: Resolve a hostname to its IP address string."""
+    """
+    FIX V2 — resolve hostname to IP using getaddrinfo (supports IPv4 + IPv6).
+    Returns the first resolved address as a string.
+    """
     try:
-        return socket.gethostbyname(target)
+        results = socket.getaddrinfo(target, None)
+        if results:
+            return results[0][4][0]
     except socket.gaierror:
-        return None
+        pass
+    return None
+
+
+def _is_remote(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """
+    FIX R2 — a host is 'remote' (requires --force) only if it is BOTH
+    not loopback AND not private. LAN addresses are allowed by default.
+    """
+    return not ip.is_loopback and not ip.is_private
 
 
 def target_allowed(target: str, force: bool = False) -> bool:
     """
     Three-step guard:
-      1. Format check (FIX A)  — blocks injection characters.
-      2. CIDR check   (FIX F)  — single hosts only.
-      3. Scope check  (FIX H)  — resolves hostname to IP, then tests private/loopback.
+      1. Format check  — blocks injection characters.
+      2. CIDR check    — single hosts only.
+      3. Scope check   — resolves hostname, rejects non-private unless --force.
     """
     if not _SAFE_TARGET_RE.match(target):
         print(f"[!] Target '{target}' failed format validation (possible injection).")
@@ -319,7 +409,6 @@ def target_allowed(target: str, force: bool = False) -> bool:
     if force:
         return True
 
-    # FIX H: resolve before scope check so hostnames are properly evaluated
     resolved = _resolve_to_ip(target)
     if resolved is None:
         print(f"[!] Could not resolve '{target}' — refusing to scan.")
@@ -327,10 +416,13 @@ def target_allowed(target: str, force: bool = False) -> bool:
 
     try:
         ip = ipaddress.ip_address(resolved)
-        allowed = ip.is_loopback or ip.is_private
-        if not allowed:
-            print(f"[!] '{target}' resolves to {resolved} which is not loopback/private.")
-        return allowed
+        if _is_remote(ip):
+            print(
+                f"[!] '{target}' resolves to {resolved} which is not loopback/private. "
+                "Use --force to allow."
+            )
+            return False
+        return True
     except ValueError:
         print(f"[!] Resolved address '{resolved}' is not a valid IP.")
         return False
@@ -360,10 +452,8 @@ def validate_ports(ports: Optional[str]) -> Optional[str]:
 
 def sanitise_flags(flags: Optional[str]) -> str:
     """
-    FIX B: Safe shlex split.
-    FIX I: -T5 clamped to -T4.
-    FIX J: Returns DEFAULT_FLAGS when nothing valid remains.
-    Whitelist enforced; -sA replaced with -sS.
+    Whitelist enforced; -T5 clamped to -T4; -sA replaced with -sS.
+    FIX V1: --min-rate N is now a two-token flag — handled as a pair.
     """
     if not flags:
         print(f"[*] No flags from model — using defaults: {DEFAULT_FLAGS}")
@@ -376,16 +466,30 @@ def sanitise_flags(flags: Optional[str]) -> str:
         return DEFAULT_FLAGS
 
     safe: list[str] = []
-    for tok in tokens:
-        if tok == "-T5":                          # FIX I
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+
+        # FIX V1: --min-rate requires a numeric argument immediately after it
+        if tok == "--min-rate":
+            if i + 1 < len(tokens) and re.fullmatch(r'\d+', tokens[i + 1]):
+                safe.append("--min-rate")
+                safe.append(tokens[i + 1])
+                i += 2
+            else:
+                print("[!] --min-rate requires a numeric argument — skipping.")
+                i += 1
+            continue
+
+        if tok == "-T5":
             print("[!] -T5 clamped to -T4 to prevent network flooding.")
             safe.append("-T4")
         elif tok in ALLOWED_FLAGS:
             safe.append(tok)
         else:
             print(f"[!] Ignoring unsafe/unknown flag: {tok!r}")
+        i += 1
 
-    # Fix -sA: replace with -sS
     if "-sA" in safe:
         reason = (
             "does not discover open ports so -sV has nothing to work on"
@@ -404,25 +508,24 @@ def sanitise_flags(flags: Optional[str]) -> str:
 
 # ── Nmap runner ───────────────────────────────────────────────────────────────
 
-def _run_nmap(cmd: list[str]) -> Dict[str, Any]:
+def _run_nmap(cmd: list[str], timeout: int = SCAN_TIMEOUT) -> Dict[str, Any]:
     """
-    Execute nmap with -oX - and parse XML output.
-    FIX C: 10 MB ceiling on stdout before parsing.
-    FIX G: Never returns raw_xml — all errors are clean dicts.
+    Execute nmap with -oX and parse XML.
+    Returns {"timed_out": True} on timeout so the caller can retry (FIX V3).
     """
     print("[*] Running:", " ".join(shlex.quote(c) for c in cmd))
     try:
         proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=SCAN_TIMEOUT,
+            cmd, capture_output=True, text=True, timeout=timeout,
         )
     except subprocess.TimeoutExpired:
-        return {"error": f"nmap timed out after {SCAN_TIMEOUT}s"}
+        return {"timed_out": True, "error": f"nmap timed out after {timeout}s"}
 
     if proc.returncode != 0 and not proc.stdout.strip():
         print("[!] nmap stderr:", proc.stderr.strip(), file=sys.stderr)
         return {"error": proc.stderr.strip() or "nmap returned non-zero exit code"}
 
-    if len(proc.stdout.encode()) > MAX_XML_BYTES:           # FIX C
+    if len(proc.stdout.encode()) > MAX_XML_BYTES:
         return {"error": f"nmap output exceeded {MAX_XML_BYTES // (1024*1024)} MB — parse aborted"}
 
     try:
@@ -451,7 +554,7 @@ def _run_nmap(cmd: list[str]) -> Dict[str, Any]:
                 })
             hosts.append(hostdict)
         return {"hosts": hosts}
-    except ET.ParseError as exc:                             # FIX G
+    except ET.ParseError as exc:
         return {"error": f"XML parse error: {exc}"}
     except Exception as exc:
         return {"error": f"Unexpected parse error: {exc}"}
@@ -459,38 +562,49 @@ def _run_nmap(cmd: list[str]) -> Dict[str, Any]:
 
 # ── Main scan logic ───────────────────────────────────────────────────────────
 
-def run_nmap_direct(target: str, ports: Optional[str], flags: Optional[str]) -> Dict[str, Any]:
+def run_nmap_direct(
+    target: str,
+    ports: Optional[str],
+    flags: Optional[str],
+    retry_on_timeout: bool = True,
+) -> Dict[str, Any]:
     """
-    2-stage smart scan:
-      Stage 1: discovery (no -sV) → find open ports.
-      Stage 2: -sV on open ports only, carrying forward all safe flags (FIX D).
-
-    FIX E: -sU + 1-65535 → restricted to common UDP ports.
+    2-stage smart scan (discovery → version detection on open ports).
+    FIX V3: retries with top-1000 ports on timeout.
     """
     ports = validate_ports(normalise_ports(ports))
-    flags = sanitise_flags(flags)          # always returns a non-empty string (FIX J)
+    flags = sanitise_flags(flags)
 
-    # FIX E: UDP + full-range guard
     if "-sU" in flags and ports == "1-65535":
         print(f"[!] UDP full-range scan restricted to common ports: {UDP_SAFE_PORTS}")
         ports = UDP_SAFE_PORTS
 
     wants_version = "-sV" in flags
 
-    if wants_version:
-        # Stage 1: discovery — strip -sV for speed
+    def _build_disc_cmd(p: Optional[str]) -> list[str]:
         try:
             disc_tokens = [f for f in shlex.split(flags) if f != "-sV"] or ["-sS", "-Pn", "-T4"]
         except ValueError:
             disc_tokens = ["-sS", "-Pn", "-T4"]
+        cmd = ["nmap", "-oX", "-"] + disc_tokens
+        if p:
+            cmd += ["-p", p]
+        cmd += [target]
+        return cmd
 
-        cmd1 = ["nmap", "-oX", "-"] + disc_tokens
-        if ports:
-            cmd1 += ["-p", ports]
-        cmd1 += [target]
-
+    if wants_version:
+        cmd1 = _build_disc_cmd(ports)
         print("[*] Stage 1 — port discovery")
+
+        t0 = time.monotonic()
         stage1 = _run_nmap(cmd1)
+
+        # FIX V3: retry on timeout with top-1000 ports
+        if stage1.get("timed_out") and retry_on_timeout and ports:
+            print("[!] Stage 1 timed out — retrying with top 1000 ports...")
+            cmd1_retry = _build_disc_cmd(None)
+            stage1 = _run_nmap(cmd1_retry)
+
         if "error" in stage1:
             return stage1
 
@@ -502,25 +616,34 @@ def run_nmap_direct(target: str, ports: Optional[str], flags: Optional[str]) -> 
         ]
 
         if not open_ports:
-            print("[*] No open ports found — skipping version scan.")
+            elapsed = time.monotonic() - t0
+            print(f"[*] No open ports found — skipping version scan. ({elapsed:.2f}s)")
             return stage1
 
         print(f"[*] Stage 2 — version detection on {len(open_ports)} port(s): "
               f"{','.join(open_ports)}")
 
-        # FIX D: carry forward all safe flags, add -sV, force -Pn
         try:
             base = [f for f in shlex.split(flags) if f != "-sV"]
         except ValueError:
             base = ["-sS", "-Pn", "-T4"]
-
         if "-Pn" not in base:
             base.append("-Pn")
 
         cmd2 = ["nmap", "-oX", "-"] + base + ["-sV", "-p", ",".join(open_ports), target]
-        return _run_nmap(cmd2)
+        result = _run_nmap(cmd2)
 
-    # Single-stage (no version detection)
+        # FIX V3: retry stage 2 on timeout
+        if result.get("timed_out") and retry_on_timeout:
+            print("[!] Stage 2 timed out — using stage 1 results.")
+            result = stage1
+
+        elapsed = time.monotonic() - t0
+        print(f"[*] Scan completed in {elapsed:.2f}s")  # FIX R5
+        return result
+
+    # ── Single-stage scan ──────────────────────────────────────────────────
+    t0 = time.monotonic()
     cmd = ["nmap", "-oX", "-"]
     try:
         cmd += shlex.split(flags)
@@ -529,7 +652,23 @@ def run_nmap_direct(target: str, ports: Optional[str], flags: Optional[str]) -> 
     if ports:
         cmd += ["-p", ports]
     cmd += [target]
-    return _run_nmap(cmd)
+
+    result = _run_nmap(cmd)
+
+    # FIX V3: retry single-stage on timeout
+    if result.get("timed_out") and retry_on_timeout and ports:
+        print("[!] Scan timed out — retrying with top 1000 ports...")
+        cmd_retry = ["nmap", "-oX", "-"]
+        try:
+            cmd_retry += shlex.split(flags)
+        except ValueError:
+            pass
+        cmd_retry += [target]
+        result = _run_nmap(cmd_retry)
+
+    elapsed = time.monotonic() - t0
+    print(f"[*] Scan completed in {elapsed:.2f}s")  # FIX R5
+    return result
 
 
 # ── llm-tools-nmap integration ────────────────────────────────────────────────
@@ -648,8 +787,11 @@ def ask_model_for_action(user_prompt: str, model_name: str) -> Dict[str, Any]:
 
 
 def ai_followup(result: Dict[str, Any], model_name: str) -> None:
-    """Ask the model to suggest attack paths based on enriched scan output."""
-    print("\n[*] Requesting AI follow-up analysis...")
+    """
+    FIX R4 — pass only open ports to the model to reduce noise and tokens.
+    """
+    print("\n[*] Requesting AI follow-up analysis (open ports only)...")
+    filtered = _open_ports_only(result)
     try:
         resp = ollama.chat(
             model=model_name,
@@ -658,7 +800,7 @@ def ai_followup(result: Dict[str, Any], model_name: str) -> None:
                 "content": (
                     "Given the following network scan result, suggest concrete "
                     "attack paths and prioritised next steps for a penetration tester:\n\n"
-                    + json.dumps(result, indent=2)
+                    + json.dumps(filtered, indent=2)
                 ),
             }],
         )
@@ -670,7 +812,9 @@ def ai_followup(result: Dict[str, Any], model_name: str) -> None:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Ollama-driven Nmap agent (v3).")
+    _load_external_intel()  # FIX V4: merge external intel before scanning
+
+    parser = argparse.ArgumentParser(description="Ollama-driven Nmap agent (v4).")
     parser.add_argument("--model",       default="dolphin-llama3:8b")
     parser.add_argument("--prompt",      help="Prompt (omit for interactive mode).")
     parser.add_argument("--yes",         action="store_true", help="Auto-confirm scans.")
@@ -678,6 +822,17 @@ def main():
     parser.add_argument("--no-intel",    action="store_true", help="Skip enrichment layer.")
     parser.add_argument("--ai-followup", action="store_true",
                         help="Ask the model to analyse enriched results.")
+    parser.add_argument(
+        "--profile",
+        choices=list(PROFILES),
+        default="default",
+        help="Scan profile (stealth / default / aggressive / udp).",
+    )
+    parser.add_argument(
+        "--fast",
+        action="store_true",
+        help="FIX V1: append --min-rate 1000 for faster scans.",
+    )
     args = parser.parse_args()
 
     # ── Get user prompt ───────────────────────────────────────────────────────
@@ -727,6 +882,17 @@ def main():
     if not target_allowed(target, force=args.force):
         print(f"[!] Refusing to scan '{target}'. Use --force to override.")
         sys.exit(1)
+
+    # FIX R1: merge model flags with operator profile
+    flags = apply_profile(flags, args.profile)
+
+    # FIX V1: --fast appends --min-rate 1000
+    if args.fast:
+        flags = flags + " --min-rate 1000"
+        print(f"[*] --fast enabled: appended '--min-rate 1000'. Flags: {flags}")
+
+    # Sanitise after profile + fast merge
+    flags = sanitise_flags(flags)
 
     # ── Confirm ───────────────────────────────────────────────────────────────
     if not args.yes:
