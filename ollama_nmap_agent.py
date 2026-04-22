@@ -279,7 +279,7 @@ def enrich_results(scan_result: Dict[str, Any]) -> Dict[str, Any]:
 def audit_log(target: str, result: Dict[str, Any]) -> None:
     """FIX L: Append one JSONL entry per scan to scan_audit.log."""
     entry = {
-        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+        "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
         "target":    target,
         "result":    result,
     }
