@@ -1,17 +1,37 @@
 #!/usr/bin/env python3
 """
-Ollama + Nmap agent (production-hardened v4).
+Ollama + Nmap agent (production-hardened v6).
 
-Changes from v3:
- - FIX R1 (v3): Profile merging — model flags + operator profile, timing override.
- - FIX R2 (v3): Remote detection logic corrected (not loopback AND not private).
- - FIX R3 (v3): Risk-based port sorting in output.
- - FIX R4 (v3): AI follow-up filtered to open ports only.
- - FIX R5 (v3): Scan timing printed on completion.
- - FIX V1 (v4): --fast restores --min-rate 1000; flag added to ALLOWED_FLAGS.
- - FIX V2 (v4): IPv6 support — socket.getaddrinfo() replaces gethostbyname().
- - FIX V3 (v4): Scan retry on timeout — retries with top-1000 ports automatically.
- - FIX V4 (v4): External intel file — intel.json merged over SERVICE_INTEL at startup.
+Changes from v5:
+ - FIX P1 (v6): _open_ports_only() skips hosts with no open ports — prevents
+                empty host objects being sent to the AI for follow-up analysis.
+ - FIX P2 (v6): Duplicate open ports deduplicated before stage-2 scan — rare
+                but possible when nmap reports the same portid twice.
+ - FIX P3 (v6): _load_external_intel() validates each entry before merging —
+                a bad intel.json entry can no longer corrupt SERVICE_INTEL.
+
+Changes from v4:
+ - FIX B1 (v5): State guard in enrich_results — filtered/closed ports get
+                risk="none" and are skipped from intel lookup entirely.
+ - FIX B2 (v5): Expanded SERVICE_INTEL — imap, pop3, submission, rsftp,
+                imaps, pop3s, http-alt, postgresql, vnc, nfs, rsync added.
+ - FIX B3 (v5): Prompt-level port override — "top N ports" in user prompt
+                sets ports=None (nmap default top-1000) before model can
+                override it with "1-65535".
+ - FIX B4 (v5): Exposure summary printed after enrichment — open port count
+                broken down by risk level per host.
+ - FIX B5 (v5): RISK_ORDER includes "none" so state-guarded ports sort last.
+
+Previous changes (v3/v4):
+ - FIX R1: Profile merging — model flags + operator profile, timing override.
+ - FIX R2: Remote detection logic corrected (not loopback AND not private).
+ - FIX R3: Risk-based port sorting in output.
+ - FIX R4: AI follow-up filtered to open ports only.
+ - FIX R5: Scan timing printed on completion.
+ - FIX V1: --fast restores --min-rate 1000; flag added to ALLOWED_FLAGS.
+ - FIX V2: IPv6 support — socket.getaddrinfo() replaces gethostbyname().
+ - FIX V3: Scan retry on timeout — retries with top-1000 ports automatically.
+ - FIX V4: External intel file — intel.json merged over SERVICE_INTEL at startup.
 """
 
 import argparse
@@ -66,7 +86,8 @@ INTEL_FILE     = "intel.json"           # FIX V4: external intel override path
 
 UDP_SAFE_PORTS = "53,67,68,69,123,137,138,161,162,500,514,520,1194,1900,4500,5353"
 
-RISK_ORDER = {"critical": 0, "high": 1, "medium": 2, "unknown": 3}
+# FIX B5: "none" added so state-guarded ports always sort after everything else
+RISK_ORDER = {"critical": 0, "high": 1, "medium": 2, "unknown": 3, "none": 4}
 
 # ── Scan profiles ─────────────────────────────────────────────────────────────
 
@@ -156,6 +177,15 @@ SERVICE_INTEL: Dict[str, Dict[str, Any]] = {
             "Inspect certificate validity and SANs",
         ],
     },
+    "http-alt": {
+        "risk": "medium",
+        "notes": "Alternate HTTP port — often a dev server, proxy, or admin panel.",
+        "next_steps": [
+            "Identify what application is running",
+            "Check for exposed admin interfaces",
+            "Directory brute-force (gobuster / ffuf)",
+        ],
+    },
     "ftp": {
         "risk": "high",
         "notes": "FTP transmits credentials in plaintext and often allows anonymous login.",
@@ -163,6 +193,15 @@ SERVICE_INTEL: Dict[str, Dict[str, Any]] = {
             "Test anonymous login",
             "Brute-force credentials",
             "Check for writable directories",
+        ],
+    },
+    "rsftp": {
+        "risk": "medium",
+        "notes": "Non-standard / alternate FTP service. Behaviour may differ from standard FTP.",
+        "next_steps": [
+            "Banner-grab to identify actual service (nc target 26)",
+            "Test anonymous login",
+            "Compare behaviour against standard FTP attacks",
         ],
     },
     "smb": {
@@ -192,6 +231,15 @@ SERVICE_INTEL: Dict[str, Dict[str, Any]] = {
             "Check for UDF privilege escalation",
         ],
     },
+    "postgresql": {
+        "risk": "high",
+        "notes": "PostgreSQL exposed. Often misconfigured with trust auth.",
+        "next_steps": [
+            "Test with default user 'postgres' and blank password",
+            "Enumerate databases",
+            "Check pg_hba.conf trust entries via error messages",
+        ],
+    },
     "mssql": {
         "risk": "high",
         "notes": "Microsoft SQL Server exposed.",
@@ -210,6 +258,15 @@ SERVICE_INTEL: Dict[str, Dict[str, Any]] = {
             "Verify NLA is enforced",
         ],
     },
+    "vnc": {
+        "risk": "high",
+        "notes": "VNC remote desktop — commonly runs with no auth or weak passwords.",
+        "next_steps": [
+            "Test for unauthenticated access",
+            "Brute-force VNC password",
+            "Check for CVE-2006-2369 (RealVNC auth bypass)",
+        ],
+    },
     "telnet": {
         "risk": "critical",
         "notes": "Cleartext protocol — credentials visible on the wire.",
@@ -226,6 +283,50 @@ SERVICE_INTEL: Dict[str, Dict[str, Any]] = {
             "Test open relay (RCPT TO external address)",
             "Enumerate users via VRFY / EXPN",
             "Check for outdated software CVEs",
+        ],
+    },
+    "submission": {
+        "risk": "medium",
+        "notes": "SMTP submission port (587). Should require authentication — verify it does.",
+        "next_steps": [
+            "Test unauthenticated relay",
+            "Check for STARTTLS enforcement",
+            "Enumerate SASL auth mechanisms",
+        ],
+    },
+    "imap": {
+        "risk": "medium",
+        "notes": "IMAP mail access. Credentials sent in plaintext unless STARTTLS is enforced.",
+        "next_steps": [
+            "Test for cleartext auth (STARTTLS not required)",
+            "Brute-force credentials",
+            "Check for known Dovecot / Cyrus CVEs",
+        ],
+    },
+    "imaps": {
+        "risk": "medium",
+        "notes": "IMAP over TLS. Encrypted but still an auth brute-force target.",
+        "next_steps": [
+            "Brute-force credentials",
+            "Inspect TLS certificate for info leakage",
+            "Check for known mail-server CVEs",
+        ],
+    },
+    "pop3": {
+        "risk": "medium",
+        "notes": "POP3 mail retrieval. Often cleartext — high credential exposure.",
+        "next_steps": [
+            "Check if STARTTLS is available and enforced",
+            "Brute-force credentials",
+            "Recommend migration to IMAP+TLS",
+        ],
+    },
+    "pop3s": {
+        "risk": "medium",
+        "notes": "POP3 over TLS. Encrypted but still an auth brute-force target.",
+        "next_steps": [
+            "Brute-force credentials",
+            "Inspect TLS certificate for info leakage",
         ],
     },
     "dns": {
@@ -255,6 +356,24 @@ SERVICE_INTEL: Dict[str, Dict[str, Any]] = {
             "Check for cleartext attribute leakage",
         ],
     },
+    "nfs": {
+        "risk": "high",
+        "notes": "NFS shares may be world-readable or world-writable.",
+        "next_steps": [
+            "List exports: showmount -e target",
+            "Mount and inspect accessible shares",
+            "Check for no_root_squash misconfiguration",
+        ],
+    },
+    "rsync": {
+        "risk": "high",
+        "notes": "rsync daemon — unauthenticated modules expose full filesystem paths.",
+        "next_steps": [
+            "List modules: rsync target::",
+            "Download accessible module contents",
+            "Check for writable modules (potential RCE via cron)",
+        ],
+    },
     "mongodb": {
         "risk": "critical",
         "notes": "MongoDB with no auth exposes all data.",
@@ -279,14 +398,31 @@ SERVICE_INTEL: Dict[str, Dict[str, Any]] = {
 def _load_external_intel() -> None:
     """
     FIX V4 — merge intel.json (if present) into SERVICE_INTEL at startup.
-    Operators can extend or override built-in entries without touching the source.
+    FIX P3 — validate each entry before merging: must be a dict containing
+             at least a "risk" key so a malformed file cannot corrupt the
+             built-in intel table or cause KeyError during enrichment.
     """
     try:
         with open(INTEL_FILE) as fh:
             external = json.load(fh)
-        if isinstance(external, dict):
-            SERVICE_INTEL.update(external)
-            print(f"[*] Loaded {len(external)} intel entries from {INTEL_FILE}")
+        if not isinstance(external, dict):
+            print(f"[!] {INTEL_FILE} must be a JSON object — skipping.", file=sys.stderr)
+            return
+        accepted = 0
+        for key, entry in external.items():
+            if not isinstance(entry, dict):
+                print(f"[!] Intel entry {key!r} is not a dict — skipping.", file=sys.stderr)
+                continue
+            if "risk" not in entry:
+                print(f"[!] Intel entry {key!r} missing 'risk' field — skipping.", file=sys.stderr)
+                continue
+            if entry["risk"] not in RISK_ORDER:
+                print(f"[!] Intel entry {key!r} has invalid risk {entry['risk']!r} — skipping.",
+                      file=sys.stderr)
+                continue
+            SERVICE_INTEL[key] = entry
+            accepted += 1
+        print(f"[*] Loaded {accepted}/{len(external)} valid intel entries from {INTEL_FILE}")
     except FileNotFoundError:
         pass
     except (json.JSONDecodeError, OSError) as exc:
@@ -297,13 +433,28 @@ def _load_external_intel() -> None:
 
 def enrich_results(scan_result: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Attach risk/notes/next_steps/cve_hint per port, then sort ports by risk (R3).
+    Attach risk/notes/next_steps/cve_hint per port, then sort ports by risk.
+
+    FIX B1: Filtered/closed ports are skipped immediately — they get
+    risk="none" and empty next_steps so they never appear exploitable.
+    FIX B5: RISK_ORDER includes "none" so they sort to the bottom.
     """
     if "hosts" not in scan_result:
         return scan_result
 
     for host in scan_result["hosts"]:
         for port in host.get("ports", []):
+
+            # FIX B1 — skip risk scoring for any port that is not open
+            if port.get("state") != "open":
+                port["risk"]       = "none"
+                port["notes"]      = (
+                    f"Port not accessible (state: {port.get('state', 'unknown')}). "
+                    "No exploitation path."
+                )
+                port["next_steps"] = []
+                continue
+
             service = (port.get("service") or "").lower().strip()
             version = port.get("version")
 
@@ -325,7 +476,7 @@ def enrich_results(scan_result: Dict[str, Any]) -> Dict[str, Any]:
             if version and service:
                 port["cve_hint"] = f"Search: {service} {version} exploit CVE"
 
-        # FIX R3 — sort ports: critical first, then high, medium, unknown
+        # FIX R3 + B5 — sort: critical → high → medium → unknown → none
         host["ports"].sort(
             key=lambda p: (
                 RISK_ORDER.get(p.get("risk", "unknown"), 3),
@@ -339,15 +490,42 @@ def enrich_results(scan_result: Dict[str, Any]) -> Dict[str, Any]:
 def _open_ports_only(scan_result: Dict[str, Any]) -> Dict[str, Any]:
     """
     FIX R4 — strip closed/filtered ports before sending to the AI.
-    Returns a shallow copy with only open ports included.
+    FIX P1 — skip hosts that have no open ports entirely so the AI
+              is not given useless empty host objects.
+    Returns a shallow copy with only reachable hosts and their open ports.
     """
     result = dict(scan_result)
     result["hosts"] = []
     for host in scan_result.get("hosts", []):
         h = dict(host)
         h["ports"] = [p for p in host.get("ports", []) if p.get("state") == "open"]
-        result["hosts"].append(h)
+        if h["ports"]:                   # FIX P1: drop hosts with nothing open
+            result["hosts"].append(h)
     return result
+
+
+def print_exposure_summary(res: Dict[str, Any]) -> None:
+    """
+    FIX B4 — print a human-readable exposure summary per host after enrichment.
+    Shows open port count broken down by risk level.
+    """
+    for host in res.get("hosts", []):
+        open_ports = [p for p in host.get("ports", []) if p.get("state") == "open"]
+        if not open_ports:
+            print(f"\n[EXPOSURE SUMMARY] {host.get('ip')} — no open ports found.")
+            continue
+
+        by_risk: Dict[str, List[str]] = {}
+        for p in open_ports:
+            by_risk.setdefault(p.get("risk", "unknown"), []).append(
+                f"{p['port']}/{p.get('service', '?')}"
+            )
+
+        print(f"\n[EXPOSURE SUMMARY] {host.get('ip')} — {len(open_ports)} open port(s)")
+        for level in ("critical", "high", "medium", "unknown"):
+            if level in by_risk:
+                ports_str = ", ".join(by_risk[level])
+                print(f"  {level.upper():8s}  {ports_str}")
 
 
 # ── Audit log ─────────────────────────────────────────────────────────────────
@@ -445,6 +623,39 @@ def validate_ports(ports: Optional[str]) -> Optional[str]:
     if re.fullmatch(r'[\d,\-]+', ports):
         return ports
     print(f"[!] Invalid port format '{ports}' — defaulting to top 1000 ports.")
+    return None
+
+
+# ── Prompt-level port override (FIX B3) ──────────────────────────────────────
+
+# Matches: "top 10 ports", "top-20 port", "top 100 ports", etc.
+_TOP_N_RE = re.compile(r'\btop[\s\-]?(\d+)\s+ports?\b', re.IGNORECASE)
+
+
+def extract_prompt_port_override(prompt: str) -> Optional[str]:
+    """
+    FIX B3 — detect 'top N ports' in the user prompt and return the
+    appropriate nmap port spec. Returns None when no override is needed.
+
+    Nmap's --top-ports flag is used for values ≤ 1000; for larger values
+    we fall back to None (nmap default top-1000) since --top-ports has
+    an upper bound in practice.
+    """
+    m = _TOP_N_RE.search(prompt)
+    if not m:
+        return "NONE"          # sentinel: no override found
+
+    n = int(m.group(1))
+    if n <= 1000:
+        # Return a special token; we handle --top-ports in run_nmap_direct
+        override = f"__top_{n}__"
+        print(f"[*] Prompt override: 'top {n} ports' detected — "
+              f"will use nmap --top-ports {n}.")
+        return override
+
+    # n > 1000 — nmap doesn't support --top-ports that high, use default
+    print(f"[*] Prompt override: 'top {n} ports' detected — "
+          f"n > 1000, using nmap default top-1000.")
     return None
 
 
@@ -571,7 +782,16 @@ def run_nmap_direct(
     """
     2-stage smart scan (discovery → version detection on open ports).
     FIX V3: retries with top-1000 ports on timeout.
+    FIX B3: handles __top_N__ sentinel from prompt port override.
     """
+    # FIX B3: handle __top_N__ sentinel — convert to nmap --top-ports flag
+    top_ports_flag: Optional[str] = None
+    if isinstance(ports, str) and ports.startswith("__top_") and ports.endswith("__"):
+        n = ports[6:-2]
+        top_ports_flag = n
+        ports = None    # clear so validate_ports doesn't trip on it
+        print(f"[*] Using --top-ports {n} from prompt override.")
+
     ports = validate_ports(normalise_ports(ports))
     flags = sanitise_flags(flags)
 
@@ -581,39 +801,41 @@ def run_nmap_direct(
 
     wants_version = "-sV" in flags
 
-    def _build_disc_cmd(p: Optional[str]) -> list[str]:
+    def _build_disc_cmd(p: Optional[str], top_n: Optional[str] = None) -> list[str]:
         try:
             disc_tokens = [f for f in shlex.split(flags) if f != "-sV"] or ["-sS", "-Pn", "-T4"]
         except ValueError:
             disc_tokens = ["-sS", "-Pn", "-T4"]
         cmd = ["nmap", "-oX", "-"] + disc_tokens
-        if p:
+        if top_n:
+            cmd += ["--top-ports", top_n]
+        elif p:
             cmd += ["-p", p]
         cmd += [target]
         return cmd
 
     if wants_version:
-        cmd1 = _build_disc_cmd(ports)
+        cmd1 = _build_disc_cmd(ports, top_n=top_ports_flag)
         print("[*] Stage 1 — port discovery")
 
         t0 = time.monotonic()
         stage1 = _run_nmap(cmd1)
 
         # FIX V3: retry on timeout with top-1000 ports
-        if stage1.get("timed_out") and retry_on_timeout and ports:
+        if stage1.get("timed_out") and retry_on_timeout and (ports or top_ports_flag):
             print("[!] Stage 1 timed out — retrying with top 1000 ports...")
-            cmd1_retry = _build_disc_cmd(None)
+            cmd1_retry = _build_disc_cmd(None, top_n=None)
             stage1 = _run_nmap(cmd1_retry)
 
         if "error" in stage1:
             return stage1
 
-        open_ports = [
+        open_ports = list(dict.fromkeys(   # FIX P2: deduplicate, preserve order
             p["port"]
             for h in stage1.get("hosts", [])
             for p in h.get("ports", [])
             if p.get("state") == "open"
-        ]
+        ))
 
         if not open_ports:
             elapsed = time.monotonic() - t0
@@ -649,14 +871,16 @@ def run_nmap_direct(
         cmd += shlex.split(flags)
     except ValueError:
         pass
-    if ports:
+    if top_ports_flag:
+        cmd += ["--top-ports", top_ports_flag]
+    elif ports:
         cmd += ["-p", ports]
     cmd += [target]
 
     result = _run_nmap(cmd)
 
     # FIX V3: retry single-stage on timeout
-    if result.get("timed_out") and retry_on_timeout and ports:
+    if result.get("timed_out") and retry_on_timeout and (ports or top_ports_flag):
         print("[!] Scan timed out — retrying with top 1000 ports...")
         cmd_retry = ["nmap", "-oX", "-"]
         try:
@@ -814,7 +1038,7 @@ def ai_followup(result: Dict[str, Any], model_name: str) -> None:
 def main():
     _load_external_intel()  # FIX V4: merge external intel before scanning
 
-    parser = argparse.ArgumentParser(description="Ollama-driven Nmap agent (v4).")
+    parser = argparse.ArgumentParser(description="Ollama-driven Nmap agent (v6).")
     parser.add_argument("--model",       default="dolphin-llama3:8b")
     parser.add_argument("--prompt",      help="Prompt (omit for interactive mode).")
     parser.add_argument("--yes",         action="store_true", help="Auto-confirm scans.")
@@ -849,6 +1073,10 @@ def main():
             print("No prompt given.")
             sys.exit(0)
 
+    # FIX B3 — extract 'top N ports' from prompt before asking the model
+    # so the model cannot override it with a full port range like "1-65535"
+    prompt_port_override = extract_prompt_port_override(user_prompt)
+
     # ── Parse model action ────────────────────────────────────────────────────
     try:
         action = ask_model_for_action(user_prompt, model_name=args.model)
@@ -871,8 +1099,14 @@ def main():
         sys.exit(1)
 
     target = (action.get("target") or "").strip()
-    ports  = action.get("ports")
     flags  = action.get("flags")
+
+    # FIX B3 — apply prompt-level port override; "NONE" means no override found
+    if prompt_port_override == "NONE":
+        ports = action.get("ports")   # use whatever the model chose
+    else:
+        ports = prompt_port_override  # prompt wins over model
+        print(f"[*] Port override applied from prompt: {ports!r}")
 
     if not target:
         print("No target from model.")
@@ -918,6 +1152,7 @@ def main():
     # ── Enrich ────────────────────────────────────────────────────────────────
     if not args.no_intel:
         res = enrich_results(res)
+        print_exposure_summary(res)          # FIX B4: human-readable summary
         print("\n[*] Enriched result:")
     else:
         print("\n[*] Raw result:")
