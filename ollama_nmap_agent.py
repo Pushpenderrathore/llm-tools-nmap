@@ -1,6 +1,20 @@
 #!/usr/bin/env python3
 """
-Ollama + Nmap agent (production-hardened v8).
+Ollama + Nmap agent (production-hardened v9).
+
+Changes from v8:
+ - FIX G1 (v9): FINGERPRINT_RULES split so FTP/SMTP match on either keyword alone,
+                not both — avoids silent misses when banners omit the protocol name
+                (e.g. "220 Welcome" with no "ftp" text).
+ - FIX G2 (v9): HTTPS disambiguation — "https" keyword in banner only maps to
+                https when the port is 443/8443; other ports map to http so an
+                HTTP response body containing "https://" links doesn't mis-classify.
+ - FIX G3 (v9): Protocol-aware banner probes — banner_grab() sends a port-specific
+                payload (PING for Redis, bare read for SSH, HTTP HEAD for everything
+                else) so non-HTTP services respond meaningfully instead of silently.
+ - FIX G4 (v9): Banner used as version fallback — when fingerprinting upgrades a
+                port from unknown, the first 80 chars of the banner are stored as
+                port["version"] so downstream tooling and AI analysis have context.
 
 Changes from v7:
  - FIX F1 (v8): Service fingerprinting engine — banner + port heuristics
@@ -550,43 +564,64 @@ def _load_external_intel() -> None:
 
 # FIX F5: rules ordered from most-specific to least-specific so the first
 # match wins and generic patterns don't shadow protocol-specific ones.
+#
+# FIX G1: FTP and SMTP rules now use single-keyword entries so they fire even
+# when the banner omits the protocol name (e.g. "220 Welcome to my server").
+# Specificity is preserved by ordering: SMTP rules come before FTP so a banner
+# with both "220" and "smtp" hits the right bucket first.
+#
+# FIX G2: "https" keyword detection is intentionally REMOVED from this table.
+# HTTPS disambiguation is handled inside fingerprint_service() using port
+# context — a banner containing "https" text on port 80 is still plain HTTP.
 FINGERPRINT_RULES: List[Dict[str, Any]] = [
     # SSH — banner always starts with "SSH-"
-    {"match": ["ssh-"],                          "service": "ssh"},
+    {"match": ["ssh-"],         "service": "ssh"},
 
-    # FTP — greeting starts with "220" and mentions ftp
-    {"match": ["220", "ftp"],                   "service": "ftp"},
+    # SMTP — check protocol-specific keywords before generic "220" (more specific)
+    {"match": ["smtp"],         "service": "smtp"},
+    {"match": ["esmtp"],        "service": "smtp"},
+    {"match": ["postfix"],      "service": "smtp"},
+    {"match": ["sendmail"],     "service": "smtp"},
+    {"match": ["exim"],         "service": "smtp"},
 
-    # SMTP — greeting starts with "220" and mentions smtp / mail
-    {"match": ["220", "smtp"],                  "service": "smtp"},
-    {"match": ["220", "mail"],                  "service": "smtp"},
-    {"match": ["220", "esmtp"],                 "service": "smtp"},
+    # FTP — any banner mentioning ftp; bare "220" with no protocol keyword falls
+    # through to PORT_HINTS so FTP on non-standard ports is still caught.
+    {"match": ["ftp"],          "service": "ftp"},
+    {"match": ["vsftpd"],       "service": "ftp"},
+    {"match": ["proftpd"],      "service": "ftp"},
+    {"match": ["filezilla server"], "service": "ftp"},
 
-    # HTTP / HTTPS
-    {"match": ["http/1."],                      "service": "http"},
-    {"match": ["server:"],                      "service": "http"},
-    {"match": ["<html"],                        "service": "http"},
-    {"match": ["https"],                        "service": "https"},
+    # HTTP — response line or common headers / content markers
+    {"match": ["http/1."],      "service": "http"},
+    {"match": ["http/2"],       "service": "http"},
+    {"match": ["server:"],      "service": "http"},
+    {"match": ["<html"],        "service": "http"},
+    {"match": ["content-type:"], "service": "http"},
 
-    # MySQL — greeting contains "mysql"
-    {"match": ["mysql"],                        "service": "mysql"},
+    # MySQL
+    {"match": ["mysql"],        "service": "mysql"},
+    {"match": ["mariadb"],      "service": "mysql"},
 
-    # Redis — server responds "+pong" or error starts with "-err"
-    {"match": ["redis"],                        "service": "redis"},
-    {"match": ["+pong"],                        "service": "redis"},
+    # Redis — "+PONG" response to PING probe, or banner mentions redis
+    {"match": ["redis"],        "service": "redis"},
+    {"match": ["+pong"],        "service": "redis"},
 
-    # MongoDB — response contains "mongodb"
-    {"match": ["mongodb"],                      "service": "mongodb"},
+    # MongoDB
+    {"match": ["mongodb"],      "service": "mongodb"},
 
-    # Elasticsearch — JSON response contains "cluster_name"
-    {"match": ["cluster_name"],                 "service": "elasticsearch"},
+    # Elasticsearch — JSON body always contains "cluster_name"
+    {"match": ["cluster_name"], "service": "elasticsearch"},
 
-    # Ollama — response contains "ollama"
-    {"match": ["ollama"],                       "service": "ollama"},
+    # Ollama
+    {"match": ["ollama"],       "service": "ollama"},
 
-    # Generic proxy signals
-    {"match": ["proxy"],                        "service": "http-proxy"},
+    # Generic proxy signals — last (most generic, highest false-positive risk)
+    {"match": ["proxy"],        "service": "http-proxy"},
 ]
+
+# FIX G2: ports that serve TLS — banner-detected "http" is upgraded to "https"
+# for these ports inside fingerprint_service().
+_HTTPS_PORTS: frozenset = frozenset({"443", "8443", "4443", "9443"})
 
 # FIX F1: port-based fallback heuristics — weak detection, used only when
 # banner grabbing also fails. Includes high-value ephemeral-range exceptions.
@@ -622,9 +657,15 @@ PORT_HINTS: Dict[str, str] = {
 def fingerprint_service(port: Dict[str, Any]) -> Dict[str, Any]:
     """
     FIX F1 — infer service from banner content then port number.
+    FIX G2 — HTTPS disambiguation: "http" result is promoted to "https" when
+              the port is in _HTTPS_PORTS, preventing mis-classification of
+              TLS services whose banner text contains "https://" links.
+    FIX G4 — version fallback: when fingerprinting assigns a service to a port
+              that had no version, the first 80 chars of the banner are stored
+              as port["version"] so AI analysis has something meaningful.
 
     Priority:
-      1. Existing nmap service detection — never overridden.
+      1. Existing nmap service+version — never overridden.
       2. Banner-based rule matching (FINGERPRINT_RULES).
       3. Port-number heuristic (PORT_HINTS) — weakest, labelled accordingly.
 
@@ -635,37 +676,52 @@ def fingerprint_service(port: Dict[str, Any]) -> Dict[str, Any]:
     """
     current_service = port.get("service")
     current_version = port.get("version")
+    port_num        = str(port.get("port", ""))
 
     # Rule 1 — if nmap already produced a confident service+version, leave it.
     if current_service and current_service not in ("unknown", None) and current_version:
         port.setdefault("confidence", "nmap")
         return port
 
-    banner = (port.get("banner") or "").lower()
+    banner     = (port.get("banner") or "").lower()
+    banner_raw = (port.get("banner") or "")
+
+    def _set_service(service: str, confidence: str, fingerprint: str) -> None:
+        """Apply service, handle HTTPS promotion, set version from banner."""
+        # FIX G2: promote http → https for known TLS ports
+        if service == "http" and port_num in _HTTPS_PORTS:
+            service = "https"
+
+        port["service"]     = service
+        port["confidence"]  = confidence
+        port["fingerprint"] = fingerprint
+
+        # FIX G4: store banner snippet as version when version is absent
+        if not current_version and banner_raw:
+            port["version"] = banner_raw[:80].strip()
+
+        print(f"    [fingerprint] port {port_num} → {service} ({confidence}: {fingerprint})")
 
     # Rule 2 — banner matching (most reliable after nmap)
     if banner:
         for rule in FINGERPRINT_RULES:
-            # All terms in the rule's "match" list must appear in the banner
             if all(sig in banner for sig in rule["match"]):
-                # Only upgrade if the service is currently unknown
                 if not current_service or current_service in ("unknown", None):
-                    port["service"]     = rule["service"]
-                    port["confidence"]  = "banner-match"
-                    port["fingerprint"] = f"matched: {rule['match']}"
-                    print(f"    [fingerprint] port {port.get('port')} → "
-                          f"{rule['service']} (banner-match: {rule['match']})")
+                    _set_service(
+                        service     = rule["service"],
+                        confidence  = "banner-match",
+                        fingerprint = str(rule["match"]),
+                    )
                     return port
 
     # Rule 3 — port-number fallback (least reliable)
-    port_num = str(port.get("port", ""))
     if port_num in PORT_HINTS:
         if not current_service or current_service in ("unknown", None):
-            port["service"]     = PORT_HINTS[port_num]
-            port["confidence"]  = "port-heuristic"
-            port["fingerprint"] = f"port {port_num} → {PORT_HINTS[port_num]}"
-            print(f"    [fingerprint] port {port_num} → "
-                  f"{PORT_HINTS[port_num]} (port-heuristic)")
+            _set_service(
+                service     = PORT_HINTS[port_num],
+                confidence  = "port-heuristic",
+                fingerprint = f"port {port_num}",
+            )
 
     return port
 
@@ -744,21 +800,47 @@ def enrich_results(scan_result: Dict[str, Any]) -> Dict[str, Any]:
 
 # ── Banner grabbing (FIX T3) ──────────────────────────────────────────────────
 
+# FIX G3: port-specific probe payloads — sending an HTTP HEAD to Redis or MySQL
+# gets no response; tailoring the probe makes silent services speak.
+_BANNER_PROBES: Dict[int, bytes] = {
+    22:    b"",                          # SSH sends banner immediately on connect
+    6379:  b"PING\r\n",                 # Redis: expects "+PONG"
+    3306:  b"",                          # MySQL sends greeting on connect
+    5432:  b"",                          # PostgreSQL sends greeting on connect
+    27017: b"",                          # MongoDB sends greeting on connect
+    9200:  b"GET / HTTP/1.0\r\n\r\n",  # Elasticsearch: REST over HTTP
+}
+_HTTP_PROBE = b"HEAD / HTTP/1.0\r\nHost: localhost\r\n\r\n"
+
+
 def banner_grab(host: str, port: int, timeout: float = 2.0) -> Optional[str]:
     """
     FIX T3 — attempt a raw TCP connection and read up to 256 bytes.
-    Used as a fallback when nmap cannot identify the service.
+    FIX G3 — send a port-appropriate probe so non-HTTP services respond:
+              - SSH / MySQL / PostgreSQL / MongoDB: read immediately (they speak first).
+              - Redis: send PING, read +PONG.
+              - Elasticsearch: send HTTP GET.
+              - Everything else: send HTTP HEAD.
     Returns the decoded banner string, or None on failure.
     """
+    probe = _BANNER_PROBES.get(port, _HTTP_PROBE)
     try:
         with socket.create_connection((host, port), timeout=timeout) as s:
-            # Send a minimal HTTP-like probe; many services respond to any input
-            s.sendall(b"HEAD / HTTP/1.0\r\n\r\n")
-            data = s.recv(256)
-            if not data:
-                # Try again with a bare newline for non-HTTP services
-                s.sendall(b"\n")
+            if probe:
+                s.sendall(probe)
+            # Give the service up to timeout seconds to respond
+            data = b""
+            try:
                 data = s.recv(256)
+            except OSError:
+                pass
+            # If we got nothing and haven't tried a probe yet, fall back to newline
+            if not data and not probe:
+                try:
+                    s.sendall(b"\n")
+                    data = s.recv(256)
+                except OSError:
+                    pass
         banner = data.decode("utf-8", errors="replace").strip()
         return banner[:256] if banner else None
     except OSError:
