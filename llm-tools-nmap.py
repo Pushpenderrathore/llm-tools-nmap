@@ -3,6 +3,7 @@ import subprocess
 import shlex
 import socket
 import re
+from validation_engine_v1 import run_validation_pipeline
 
 
 def get_local_network_info():
