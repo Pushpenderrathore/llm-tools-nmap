@@ -1,86 +1,65 @@
 #!/usr/bin/env python3
 """
-Ollama + Nmap agent (production-hardened v10).
+Ollama + Nmap agent (production-hardened v11).
+
+Changes from v10:
+ - FIX I1 (v11): TLS probe runs even when a banner exists but looks HTTP —
+                 prevents false-negative on non-standard TLS ports (e.g. 10443)
+                 that respond with an HTTP banner before the TLS handshake.
+ - FIX I2 (v11): Fingerprint cache TTL — entries expire after CACHE_TTL_HOURS
+                 (default 24 h). Stale entries are evicted on load; service
+                 changes on rescanned hosts are detected correctly.
+ - FIX I3 (v11): Concurrent banner grabbing + fingerprinting via
+                 ThreadPoolExecutor — wall-clock time for multi-port hosts
+                 drops from O(n) serial to O(1) parallel.
+ - FIX I4 (v11): OS fingerprint correlation — when nmap -O detects Windows,
+                 SMB and RDP risk scores are elevated and their next_steps
+                 are prepended with OS-specific context.
+ - FIX I5 (v11): Exploit chaining — after enrichment the engine walks all
+                 open ports and emits a prioritised chain_of_attack list
+                 ordered by risk, describing how an attacker would pivot
+                 from the highest-risk service to lower-risk ones.
 
 Changes from v9:
- - FIX H1 (v10): Rule match_type field — FINGERPRINT_RULES entries now carry
-                 "match_type": "any" (default) or "all", replacing the blanket
-                 all() check. Single-keyword rules use "any"; compound rules
-                 that need multiple signals (e.g. MySQL+greeting) use "all".
- - FIX H2 (v10): TLS probe for unknown HTTPS ports — ssl.wrap_socket() is
-                 attempted when a banner grab fails; success → "https" with
-                 confidence "tls-probe" regardless of port number.
- - FIX H3 (v10): Per-port banner timeout — slow services (SMTP, databases,
-                 Redis) get a longer timeout; fast services keep 2 s default.
- - FIX H4 (v10): Fingerprint cache — results written to fingerprints.json so
-                 repeated scans of the same host skip banner+fingerprint work.
+ - FIX H1 (v10): Rule match_type field.
+ - FIX H2 (v10): TLS probe for unknown HTTPS ports.
+ - FIX H3 (v10): Per-port banner timeout.
+ - FIX H4 (v10): Fingerprint cache (cross-session).
 
 Changes from v8:
- - FIX G1 (v9): FINGERPRINT_RULES split so FTP/SMTP match on either keyword alone,
-                not both — avoids silent misses when banners omit the protocol name
-                (e.g. "220 Welcome" with no "ftp" text).
- - FIX G2 (v9): HTTPS disambiguation — "https" keyword in banner only maps to
-                https when the port is 443/8443; other ports map to http so an
-                HTTP response body containing "https://" links doesn't mis-classify.
- - FIX G3 (v9): Protocol-aware banner probes — banner_grab() sends a port-specific
-                payload (PING for Redis, bare read for SSH, HTTP HEAD for everything
-                else) so non-HTTP services respond meaningfully instead of silently.
- - FIX G4 (v9): Banner used as version fallback — when fingerprinting upgrades a
-                port from unknown, the first 80 chars of the banner are stored as
-                port["version"] so downstream tooling and AI analysis have context.
+ - FIX G1 (v9): FINGERPRINT_RULES split for FTP/SMTP.
+ - FIX G2 (v9): HTTPS disambiguation.
+ - FIX G3 (v9): Protocol-aware banner probes.
+ - FIX G4 (v9): Banner used as version fallback.
 
 Changes from v7:
- - FIX F1 (v8): Service fingerprinting engine — banner + port heuristics
-                upgrade "unknown" ports to classified services before enrichment.
- - FIX F2 (v8): Fingerprint confidence field — "banner-match" vs "port-heuristic"
-                so downstream tooling knows how reliable the detection is.
- - FIX F3 (v8): Banner-grab condition fixed — now triggers when version is missing,
-                not just when service is missing (catches identified-but-unversioned
-                services like upnp, ftp-proxy, etc.).
- - FIX F4 (v8): Re-enrichment pass after fingerprinting — newly classified services
-                get correct risk/notes/next_steps from SERVICE_INTEL.
- - FIX F5 (v8): FINGERPRINT_RULES expanded with SSH, FTP, SMTP, MySQL, Redis,
-                MongoDB, Elasticsearch, HTTP-proxy, Ollama, and generic patterns.
+ - FIX F1 (v8): Service fingerprinting engine.
+ - FIX F2 (v8): Fingerprint confidence field.
+ - FIX F3 (v8): Banner-grab condition fixed.
+ - FIX F4 (v8): Re-enrichment pass after fingerprinting.
+ - FIX F5 (v8): FINGERPRINT_RULES expanded.
 
 Changes from v6:
- - FIX T1 (v7): Dynamic scan timeout — loopback gets 300 s, LAN 180 s,
-                remote falls back to the original 120 s default.
- - FIX T2 (v7): Stage-2 version-scan retry with --version-light before
-                giving up — faster fingerprinting for slow responders.
- - FIX T3 (v7): Banner grabbing — open ports with no nmap service ID get
-                a raw TCP probe; banner stored as port["banner"].
- - FIX T4 (v7): Expanded SERVICE_INTEL — upnp, afs3-fileserver, ftp-proxy,
-                ollama, http-proxy, socks5, cassandra, elasticsearch added.
- - FIX T5 (v7): Audit log uses ~/scan_audit.log — avoids permission errors
-                when the script is run under different users.
+ - FIX T1 (v7): Dynamic scan timeout.
+ - FIX T2 (v7): Stage-2 version-scan retry with --version-light.
+ - FIX T3 (v7): Banner grabbing.
+ - FIX T4 (v7): Expanded SERVICE_INTEL.
+ - FIX T5 (v7): Audit log uses ~/scan_audit.log.
 
 Changes from v5:
  - FIX P1 (v6): _open_ports_only() skips hosts with no open ports.
- - FIX P2 (v6): Duplicate open ports deduplicated before stage-2 scan.
- - FIX P3 (v6): _load_external_intel() validates each entry before merging.
+ - FIX P2 (v6): Duplicate open ports deduplicated.
+ - FIX P3 (v6): _load_external_intel() validates each entry.
 
 Changes from v4:
- - FIX B1 (v5): State guard in enrich_results — filtered/closed ports get
-                risk="none" and are skipped from intel lookup entirely.
- - FIX B2 (v5): Expanded SERVICE_INTEL — imap, pop3, submission, rsftp,
-                imaps, pop3s, http-alt, postgresql, vnc, nfs, rsync added.
- - FIX B3 (v5): Prompt-level port override — "top N ports" in user prompt
-                sets ports=None (nmap default top-1000) before model can
-                override it with "1-65535".
- - FIX B4 (v5): Exposure summary printed after enrichment — open port count
-                broken down by risk level per host.
- - FIX B5 (v5): RISK_ORDER includes "none" so state-guarded ports sort last.
+ - FIX B1 (v5): State guard in enrich_results.
+ - FIX B2 (v5): Expanded SERVICE_INTEL.
+ - FIX B3 (v5): Prompt-level port override.
+ - FIX B4 (v5): Exposure summary printed after enrichment.
+ - FIX B5 (v5): RISK_ORDER includes "none".
 
 Previous changes (v3/v4):
- - FIX R1: Profile merging — model flags + operator profile, timing override.
- - FIX R2: Remote detection logic corrected (not loopback AND not private).
- - FIX R3: Risk-based port sorting in output.
- - FIX R4: AI follow-up filtered to open ports only.
- - FIX R5: Scan timing printed on completion.
- - FIX V1: --fast restores --min-rate 1000; flag added to ALLOWED_FLAGS.
- - FIX V2: IPv6 support — socket.getaddrinfo() replaces gethostbyname().
- - FIX V3: Scan retry on timeout — retries with top-1000 ports automatically.
- - FIX V4: External intel file — intel.json merged over SERVICE_INTEL at startup.
+ - FIX R1–R5, FIX V1–V4.
 """
 
 import argparse
@@ -96,6 +75,7 @@ import subprocess
 import sys
 import time
 import importlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, Iterable, List, Optional
 
 try:
@@ -119,48 +99,48 @@ for _name in ("llm_tools_nmap", "llm-tools-nmap", "llm_tools.nmap", "llm_tools_n
 
 # ── Security / scan constants ─────────────────────────────────────────────────
 
-_SAFE_TARGET_RE = re.compile(r'^[a-zA-Z0-9.\-:\[\]]{1,253}$')  # FIX V2: allow [] for IPv6
+_SAFE_TARGET_RE = re.compile(r'^[a-zA-Z0-9.\-:\[\]]{1,253}$')
 
 ALLOWED_FLAGS: set[str] = {
     "-sS", "-sT", "-sV", "-sU", "-O", "-A",
     "-Pn", "-n",
     "-T1", "-T2", "-T3", "-T4", "-T5",
     "--open", "--version-light",
-    "--min-rate",                        # FIX V1: required for --fast
+    "--min-rate",
 }
 
-DEFAULT_FLAGS  = "-sS -Pn -T4"
-SCAN_TIMEOUT   = 120          # fallback for remote targets
-MAX_XML_BYTES  = 10 * 1024 * 1024
-# FIX T5: use home-dir path so permission errors from sudo vs normal user are avoided
-AUDIT_LOG_PATH = os.path.expanduser("~/scan_audit.log")
-INTEL_FILE          = "intel.json"           # FIX V4: external intel override path
-FINGERPRINT_CACHE   = "fingerprints.json"    # FIX H4: cross-session fingerprint cache
+DEFAULT_FLAGS       = "-sS -Pn -T4"
+SCAN_TIMEOUT        = 120
+MAX_XML_BYTES       = 10 * 1024 * 1024
+AUDIT_LOG_PATH      = os.path.expanduser("~/scan_audit.log")
+INTEL_FILE          = "intel.json"
+FINGERPRINT_CACHE   = "fingerprints.json"
+
+# FIX I2: cache entries older than this are considered stale and evicted.
+CACHE_TTL_HOURS     = 24
+
+# FIX I3: max worker threads for concurrent banner+fingerprint work.
+BANNER_WORKERS      = 20
 
 UDP_SAFE_PORTS = "53,67,68,69,123,137,138,161,162,500,514,520,1194,1900,4500,5353"
 
-# FIX B5: "none" added so state-guarded ports always sort after everything else
 RISK_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "unknown": 4, "none": 5}
 
 
 def _scan_timeout(target: str) -> int:
-    """
-    FIX T1 — return a timeout tuned to the target's network distance.
-    Loopback scans are safe to wait longer; remote targets keep the
-    original conservative limit.
-    """
     resolved = _resolve_to_ip(target)
     if resolved is None:
         return SCAN_TIMEOUT
     try:
         ip = ipaddress.ip_address(resolved)
         if ip.is_loopback:
-            return 300    # localhost: plenty of time for -sV probes
+            return 300
         if ip.is_private:
-            return 180    # LAN: generous but not unlimited
+            return 180
     except ValueError:
         pass
-    return SCAN_TIMEOUT   # remote / unknown: stay conservative
+    return SCAN_TIMEOUT
+
 
 # ── Scan profiles ─────────────────────────────────────────────────────────────
 
@@ -185,16 +165,10 @@ PROFILES: Dict[str, Dict[str, Any]] = {
 
 
 def apply_profile(model_flags: Optional[str], profile: str) -> str:
-    """
-    FIX R1 — merge model flags with a named operator profile.
-    Model-supplied timing flags are overridden by the profile's timing token
-    so the operator always controls scan aggressiveness.
-    """
     base = PROFILES.get(profile, PROFILES["default"])["flags"]
     if not model_flags:
         return base
 
-    # Determine profile timing token (e.g. -T2, -T4)
     profile_timing = next(
         (t for t in base.split() if re.match(r'^-T[0-9]$', t)), None
     )
@@ -204,12 +178,10 @@ def apply_profile(model_flags: Optional[str], profile: str) -> str:
     except ValueError:
         model_tokens = []
 
-    # Strip model timing tokens; they will be replaced by the profile's
     merged = [t for t in model_tokens if not re.match(r'^-T[0-9]$', t)]
     if profile_timing:
         merged.append(profile_timing)
 
-    # De-duplicate while preserving order
     seen: set[str] = set()
     result: List[str] = []
     for tok in merged:
@@ -270,9 +242,9 @@ SERVICE_INTEL: Dict[str, Dict[str, Any]] = {
     },
     "rsftp": {
         "risk": "medium",
-        "notes": "Non-standard / alternate FTP service. Behaviour may differ from standard FTP.",
+        "notes": "Non-standard / alternate FTP service.",
         "next_steps": [
-            "Banner-grab to identify actual service (nc target 26)",
+            "Banner-grab to identify actual service",
             "Test anonymous login",
             "Compare behaviour against standard FTP attacks",
         ],
@@ -360,7 +332,7 @@ SERVICE_INTEL: Dict[str, Dict[str, Any]] = {
     },
     "submission": {
         "risk": "medium",
-        "notes": "SMTP submission port (587). Should require authentication — verify it does.",
+        "notes": "SMTP submission port (587). Should require authentication.",
         "next_steps": [
             "Test unauthenticated relay",
             "Check for STARTTLS enforcement",
@@ -369,7 +341,7 @@ SERVICE_INTEL: Dict[str, Dict[str, Any]] = {
     },
     "imap": {
         "risk": "medium",
-        "notes": "IMAP mail access. Credentials sent in plaintext unless STARTTLS is enforced.",
+        "notes": "IMAP mail access. Credentials sent in plaintext unless STARTTLS enforced.",
         "next_steps": [
             "Test for cleartext auth (STARTTLS not required)",
             "Brute-force credentials",
@@ -378,7 +350,7 @@ SERVICE_INTEL: Dict[str, Dict[str, Any]] = {
     },
     "imaps": {
         "risk": "medium",
-        "notes": "IMAP over TLS. Encrypted but still an auth brute-force target.",
+        "notes": "IMAP over TLS.",
         "next_steps": [
             "Brute-force credentials",
             "Inspect TLS certificate for info leakage",
@@ -387,7 +359,7 @@ SERVICE_INTEL: Dict[str, Dict[str, Any]] = {
     },
     "pop3": {
         "risk": "medium",
-        "notes": "POP3 mail retrieval. Often cleartext — high credential exposure.",
+        "notes": "POP3 mail retrieval. Often cleartext.",
         "next_steps": [
             "Check if STARTTLS is available and enforced",
             "Brute-force credentials",
@@ -396,7 +368,7 @@ SERVICE_INTEL: Dict[str, Dict[str, Any]] = {
     },
     "pop3s": {
         "risk": "medium",
-        "notes": "POP3 over TLS. Encrypted but still an auth brute-force target.",
+        "notes": "POP3 over TLS.",
         "next_steps": [
             "Brute-force credentials",
             "Inspect TLS certificate for info leakage",
@@ -465,7 +437,6 @@ SERVICE_INTEL: Dict[str, Dict[str, Any]] = {
             "Look for RCE via cron / authorized_keys write",
         ],
     },
-    # FIX T4: additional entries for services seen on real-world scans
     "upnp": {
         "risk": "medium",
         "notes": "UPnP device discovery — can expose internal network topology.",
@@ -477,7 +448,7 @@ SERVICE_INTEL: Dict[str, Dict[str, Any]] = {
     },
     "afs3-fileserver": {
         "risk": "medium",
-        "notes": "Andrew File System. Rare outside academic networks; likely a placeholder.",
+        "notes": "Andrew File System. Rare outside academic networks.",
         "next_steps": [
             "Confirm service with banner grab (nc target 7000)",
             "Check if AFS client is genuinely running",
@@ -486,10 +457,10 @@ SERVICE_INTEL: Dict[str, Dict[str, Any]] = {
     },
     "ftp-proxy": {
         "risk": "medium",
-        "notes": "FTP proxy or relay service. May forward to internal FTP servers.",
+        "notes": "FTP proxy or relay service.",
         "next_steps": [
             "Identify proxy type via banner grab",
-            "Test whether it allows unauthenticated access to internal targets",
+            "Test for unauthenticated access to internal targets",
             "Check for SSRF / bounce-scan abuse",
         ],
     },
@@ -542,12 +513,6 @@ SERVICE_INTEL: Dict[str, Dict[str, Any]] = {
 
 
 def _load_external_intel() -> None:
-    """
-    FIX V4 — merge intel.json (if present) into SERVICE_INTEL at startup.
-    FIX P3 — validate each entry before merging: must be a dict containing
-             at least a "risk" key so a malformed file cannot corrupt the
-             built-in intel table or cause KeyError during enrichment.
-    """
     try:
         with open(INTEL_FILE) as fh:
             external = json.load(fh)
@@ -575,78 +540,36 @@ def _load_external_intel() -> None:
         print(f"[!] Could not load {INTEL_FILE}: {exc}", file=sys.stderr)
 
 
-# ── Service fingerprinting engine (FIX F1–F5) ────────────────────────────────
+# ── Service fingerprinting engine ─────────────────────────────────────────────
 
-# FIX F5: rules ordered from most-specific to least-specific so the first
-# match wins and generic patterns don't shadow protocol-specific ones.
-#
-# FIX G1: FTP and SMTP rules now use single-keyword entries so they fire even
-# when the banner omits the protocol name (e.g. "220 Welcome to my server").
-# Specificity is preserved by ordering: SMTP rules come before FTP so a banner
-# with both "220" and "smtp" hits the right bucket first.
-#
-# FIX G2: "https" keyword detection is intentionally REMOVED from this table.
-# HTTPS disambiguation is handled inside fingerprint_service() using port
-# context — a banner containing "https" text on port 80 is still plain HTTP.
-# FIX H1: each rule now carries "match_type":
-#   "any"  (default) — fire if ANY keyword is found in the banner. Use for
-#          single-keyword rules and protocol names that always appear alone.
-#   "all"  — fire only if ALL keywords are found. Use when two signals together
-#          are needed to avoid false positives (e.g. MySQL greeting + keyword).
 FINGERPRINT_RULES: List[Dict[str, Any]] = [
-    # SSH — "SSH-" prefix is unambiguous; "any" is fine
     {"match": ["ssh-"],             "service": "ssh",           "match_type": "any"},
-
-    # SMTP — ordered before FTP; specific daemon names are safe with "any"
     {"match": ["smtp"],             "service": "smtp",          "match_type": "any"},
     {"match": ["esmtp"],            "service": "smtp",          "match_type": "any"},
     {"match": ["postfix"],          "service": "smtp",          "match_type": "any"},
     {"match": ["sendmail"],         "service": "smtp",          "match_type": "any"},
     {"match": ["exim"],             "service": "smtp",          "match_type": "any"},
-
-    # FTP — specific daemon names are safe; "ftp" alone is specific enough
     {"match": ["ftp"],              "service": "ftp",           "match_type": "any"},
     {"match": ["vsftpd"],           "service": "ftp",           "match_type": "any"},
     {"match": ["proftpd"],          "service": "ftp",           "match_type": "any"},
     {"match": ["filezilla server"], "service": "ftp",           "match_type": "any"},
-
-    # HTTP — "http/1." and "http/2" are unambiguous; "server:" alone is weak
-    # so it uses "any" but comes after the more specific HTTP markers.
     {"match": ["http/1."],          "service": "http",          "match_type": "any"},
     {"match": ["http/2"],           "service": "http",          "match_type": "any"},
     {"match": ["<html"],            "service": "http",          "match_type": "any"},
     {"match": ["content-type:"],    "service": "http",          "match_type": "any"},
-    # "server:" alone could appear in non-HTTP banners — require HTTP version too
     {"match": ["server:", "http"],  "service": "http",          "match_type": "all"},
-
-    # MySQL — greeting byte sequence is binary; text fallback uses "all" to avoid
-    # false positives on banners that merely mention mysql in a description
     {"match": ["mysql"],            "service": "mysql",         "match_type": "any"},
     {"match": ["mariadb"],          "service": "mysql",         "match_type": "any"},
-
-    # Redis
     {"match": ["redis"],            "service": "redis",         "match_type": "any"},
     {"match": ["+pong"],            "service": "redis",         "match_type": "any"},
-
-    # MongoDB
     {"match": ["mongodb"],          "service": "mongodb",       "match_type": "any"},
-
-    # Elasticsearch — "cluster_name" is specific enough alone
     {"match": ["cluster_name"],     "service": "elasticsearch", "match_type": "any"},
-
-    # Ollama
     {"match": ["ollama"],           "service": "ollama",        "match_type": "any"},
-
-    # Proxy — generic; keep last
     {"match": ["proxy"],            "service": "http-proxy",    "match_type": "any"},
 ]
 
-# FIX G2: ports that serve TLS — banner-detected "http" is upgraded to "https"
-# for these ports inside fingerprint_service().
 _HTTPS_PORTS: frozenset = frozenset({"443", "8443", "4443", "9443"})
 
-# FIX F1: port-based fallback heuristics — weak detection, used only when
-# banner grabbing also fails. Includes high-value ephemeral-range exceptions.
 PORT_HINTS: Dict[str, str] = {
     "21":    "ftp",
     "22":    "ssh",
@@ -676,31 +599,44 @@ PORT_HINTS: Dict[str, str] = {
 }
 
 
+def _attempt_tls_probe(host: str, port_num: str) -> Optional[str]:
+    """
+    FIX I1 — shared TLS probe logic used by fingerprint_service().
+    Attempts an SSL handshake and returns "https" (confidence tag) on success,
+    None on failure.  Extracted so it can be called both when banner is absent
+    AND when a banner exists but looks like plain HTTP on a non-standard port.
+    """
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode    = ssl.CERT_NONE
+        with socket.create_connection((host, int(port_num or 0)), timeout=2.0) as raw_sock:
+            with ctx.wrap_socket(raw_sock) as tls_sock:
+                cert = tls_sock.getpeercert(binary_form=False) or {}
+                cn   = (cert.get("subject") or ((("",),),))[0][0][1]
+        label = f"TLS handshake OK (CN={cn})" if cn else "TLS handshake OK"
+        return label
+    except Exception:
+        return None
+
+
 def fingerprint_service(port: Dict[str, Any]) -> Dict[str, Any]:
     """
-    FIX F1 — infer service from banner content then port number.
-    FIX G2 — HTTPS disambiguation: "http" result is promoted to "https" when
-              the port is in _HTTPS_PORTS, preventing mis-classification of
-              TLS services whose banner text contains "https://" links.
-    FIX G4 — version fallback: when fingerprinting assigns a service to a port
-              that had no version, the first 80 chars of the banner are stored
-              as port["version"] so AI analysis has something meaningful.
+    Infer service from banner content then port number.
 
     Priority:
       1. Existing nmap service+version — never overridden.
       2. Banner-based rule matching (FINGERPRINT_RULES).
-      3. Port-number heuristic (PORT_HINTS) — weakest, labelled accordingly.
-
-    The 'confidence' field records which method produced the result:
-      "nmap"           — nmap -sV identified the service (original).
-      "banner-match"   — matched a FINGERPRINT_RULES pattern.
-      "port-heuristic" — fell back to PORT_HINTS mapping.
+      3. TLS probe (FIX I1) — now attempted even when a plain-HTTP banner
+         exists on a non-standard port, catching mis-identified TLS services.
+      4. Port-number heuristic (PORT_HINTS) — weakest.
     """
     current_service = port.get("service")
     current_version = port.get("version")
     port_num        = str(port.get("port", ""))
+    host            = port.get("_host", "")
 
-    # Rule 1 — if nmap already produced a confident service+version, leave it.
+    # Rule 1 — nmap already identified service + version
     if current_service and current_service not in ("unknown", None) and current_version:
         port.setdefault("confidence", "nmap")
         return port
@@ -709,29 +645,22 @@ def fingerprint_service(port: Dict[str, Any]) -> Dict[str, Any]:
     banner_raw = (port.get("banner") or "")
 
     def _set_service(service: str, confidence: str, fingerprint: str) -> None:
-        """Apply service, handle HTTPS promotion, set version from banner."""
-        # FIX G2: promote http → https for known TLS ports
         if service == "http" and port_num in _HTTPS_PORTS:
             service = "https"
-
         port["service"]     = service
         port["confidence"]  = confidence
         port["fingerprint"] = fingerprint
-
-        # FIX G4: store banner snippet as version when version is absent
         if not current_version and banner_raw:
             port["version"] = banner_raw[:80].strip()
-
         print(f"    [fingerprint] port {port_num} → {service} ({confidence}: {fingerprint})")
 
-    # Rule 2 — banner matching (most reliable after nmap)
-    # FIX H1: honour per-rule match_type ("any" = OR logic, "all" = AND logic)
+    # Rule 2 — banner rule matching
     if banner:
         for rule in FINGERPRINT_RULES:
             mtype = rule.get("match_type", "any")
             if mtype == "all":
                 matched = all(sig in banner for sig in rule["match"])
-            else:  # "any"
+            else:
                 matched = any(sig in banner for sig in rule["match"])
             if matched:
                 if not current_service or current_service in ("unknown", None):
@@ -740,31 +669,35 @@ def fingerprint_service(port: Dict[str, Any]) -> Dict[str, Any]:
                         confidence  = "banner-match",
                         fingerprint = str(rule["match"]),
                     )
+                    # FIX I1: if we matched HTTP on a non-standard (non-HTTPS) port,
+                    # still run a TLS probe — the HTTP banner may be a TLS service
+                    # that responded to our plain-TCP probe before the handshake.
+                    detected_service = port.get("service", "")
+                    if detected_service == "http" and port_num not in _HTTPS_PORTS and host:
+                        tls_label = _attempt_tls_probe(host, port_num)
+                        if tls_label:
+                            print(f"    [fingerprint] port {port_num} → upgrading http → "
+                                  f"https (TLS confirmed despite HTTP banner)")
+                            _set_service(
+                                service     = "https",
+                                confidence  = "tls-probe",
+                                fingerprint = tls_label,
+                            )
                     return port
 
-    # Rule 3 — TLS probe (FIX H2): if banner grab produced nothing and the port
-    # is not yet classified, attempt an SSL handshake. Success → "https"
-    # regardless of port number, catching non-standard TLS endpoints.
-    if (not banner) and (not current_service or current_service in ("unknown", None)):
-        try:
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode    = ssl.CERT_NONE
-            with socket.create_connection((port.get("_host", ""), int(port_num or 0)),
-                                          timeout=2.0) as raw_sock:
-                with ctx.wrap_socket(raw_sock) as tls_sock:
-                    cert = tls_sock.getpeercert(binary_form=False) or {}
-                    cn   = (cert.get("subject") or ((("",),),))[0][0][1]
-            _set_service(
-                service     = "https",
-                confidence  = "tls-probe",
-                fingerprint = f"TLS handshake OK (CN={cn})" if cn else "TLS handshake OK",
-            )
-            return port
-        except Exception:
-            pass  # not TLS, or unreachable — fall through to port hint
+    # Rule 3 — TLS probe when no banner was received or service still unknown
+    if not current_service or current_service in ("unknown", None):
+        if host:
+            tls_label = _attempt_tls_probe(host, port_num)
+            if tls_label:
+                _set_service(
+                    service     = "https",
+                    confidence  = "tls-probe",
+                    fingerprint = tls_label,
+                )
+                return port
 
-    # Rule 4 — port-number fallback (least reliable)
+    # Rule 4 — port-number fallback
     if port_num in PORT_HINTS:
         if not current_service or current_service in ("unknown", None):
             _set_service(
@@ -776,26 +709,41 @@ def fingerprint_service(port: Dict[str, Any]) -> Dict[str, Any]:
     return port
 
 
-# ── Fingerprint cache (FIX H4) ────────────────────────────────────────────────
+# ── Fingerprint cache (FIX H4 + FIX I2) ──────────────────────────────────────
 
 def _load_fingerprint_cache() -> Dict[str, Any]:
     """
-    FIX H4 — load fingerprints.json from disk.
-    Returns an empty dict if the file is absent or malformed.
-    Cache key format: "<ip>:<port>" → port dict fields (service, confidence, etc.)
+    FIX H4 — load fingerprints.json.
+    FIX I2 — evict entries older than CACHE_TTL_HOURS on load so stale
+              service mappings (e.g. after a service restart / port change)
+              are never applied.
     """
     try:
         with open(FINGERPRINT_CACHE) as fh:
             data = json.load(fh)
-        if isinstance(data, dict):
-            return data
+        if not isinstance(data, dict):
+            return {}
+
+        cutoff   = time.time() - CACHE_TTL_HOURS * 3600
+        evicted  = 0
+        fresh    = {}
+        for key, entry in data.items():
+            ts = entry.get("_ts", 0)
+            if ts >= cutoff:
+                fresh[key] = entry
+            else:
+                evicted += 1
+
+        if evicted:
+            print(f"[*] Fingerprint cache: evicted {evicted} stale entries "
+                  f"(TTL={CACHE_TTL_HOURS}h)")
+        return fresh
     except (FileNotFoundError, json.JSONDecodeError):
-        pass
-    return {}
+        return {}
 
 
 def _save_fingerprint_cache(cache: Dict[str, Any]) -> None:
-    """FIX H4 — persist fingerprint cache to disk."""
+    """FIX H4 + FIX I2 — persist cache; each entry carries a '_ts' timestamp."""
     try:
         with open(FINGERPRINT_CACHE, "w") as fh:
             json.dump(cache, fh, indent=2)
@@ -805,25 +753,27 @@ def _save_fingerprint_cache(cache: Dict[str, Any]) -> None:
 
 def apply_fingerprinting(scan_result: Dict[str, Any]) -> Dict[str, Any]:
     """
-    FIX F1 — iterate all open ports and apply fingerprint_service().
-    FIX H4 — check fingerprint cache first; write new results back to cache.
-    Called after banner_grab_scan() so banners are available.
+    FIX F1 — fingerprint open ports.
+    FIX H4 — cache layer.
+    FIX I3 — concurrent execution via ThreadPoolExecutor.
     """
     cache   = _load_fingerprint_cache()
     changed = False
+
+    # Collect all ports needing fingerprinting
+    work_items: List[tuple] = []  # (host_ip, port_dict)
 
     for host in scan_result.get("hosts", []):
         ip = host.get("ip", "")
         for port in host.get("ports", []):
             if port.get("state") != "open":
                 continue
+            port["_host"] = ip
 
             cache_key = f"{ip}:{port.get('port')}"
 
-            # FIX H4: restore cached fingerprint fields if present
             if cache_key in cache:
                 cached = cache[cache_key]
-                # Only apply if the port is still unclassified (nmap may now know)
                 if not port.get("service") or port["service"] in ("unknown", None):
                     for field in ("service", "confidence", "fingerprint", "version"):
                         if field in cached:
@@ -832,20 +782,190 @@ def apply_fingerprinting(scan_result: Dict[str, Any]) -> Dict[str, Any]:
                           f"{port.get('service')} (cache hit)")
                 continue
 
-            # Run fingerprinting and cache the result
-            fingerprint_service(port)
+            work_items.append((ip, port))
 
-            if port.get("confidence") and port["confidence"] != "nmap":
-                cache[cache_key] = {
-                    k: port[k]
-                    for k in ("service", "confidence", "fingerprint", "version")
-                    if k in port
-                }
-                changed = True
+    # FIX I3: run fingerprinting in parallel
+    if work_items:
+        print(f"[*] Fingerprinting {len(work_items)} port(s) concurrently "
+              f"(workers={BANNER_WORKERS})...")
+
+        def _fp_task(item):
+            _ip, _port = item
+            fingerprint_service(_port)
+            return (_ip, _port)
+
+        with ThreadPoolExecutor(max_workers=BANNER_WORKERS) as ex:
+            futures = {ex.submit(_fp_task, item): item for item in work_items}
+            for future in as_completed(futures):
+                try:
+                    _ip, _port = future.result()
+                    if _port.get("confidence") and _port["confidence"] != "nmap":
+                        ck = f"{_ip}:{_port.get('port')}"
+                        entry = {
+                            k: _port[k]
+                            for k in ("service", "confidence", "fingerprint", "version")
+                            if k in _port
+                        }
+                        # FIX I2: stamp the cache entry with current time
+                        entry["_ts"] = time.time()
+                        cache[ck] = entry
+                        changed = True
+                except Exception as exc:
+                    print(f"[!] Fingerprint task failed: {exc}", file=sys.stderr)
 
     if changed:
         _save_fingerprint_cache(cache)
         print(f"[*] Fingerprint cache updated → {FINGERPRINT_CACHE}")
+
+    return scan_result
+
+
+# ── OS fingerprint correlation (FIX I4) ───────────────────────────────────────
+
+# Services whose risk and next_steps should be escalated on Windows hosts.
+_WINDOWS_ESCALATE: Dict[str, Dict[str, Any]] = {
+    "smb": {
+        "risk": "critical",
+        "os_note": "Windows OS confirmed — SMB is a primary attack vector. "
+                   "Prioritise EternalBlue and credential attacks.",
+        "prepend_steps": ["Confirm SMB signing disabled: crackmapexec smb target --gen-relay-list"],
+    },
+    "microsoft-ds": {
+        "risk": "critical",
+        "os_note": "Windows OS confirmed — SMB/445 is highest priority on Windows targets.",
+        "prepend_steps": ["Run: crackmapexec smb target", "Test MS17-010 immediately"],
+    },
+    "rdp": {
+        "risk": "critical",
+        "os_note": "Windows OS confirmed — RDP is primary remote access path.",
+        "prepend_steps": [
+            "Check NLA: nmap -p 3389 --script rdp-enum-encryption target",
+            "Test BlueKeep: msfconsole → use auxiliary/scanner/rdp/cve_2019_0708_bluekeep",
+        ],
+    },
+}
+
+
+def apply_os_correlation(scan_result: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    FIX I4 — read nmap OS detection data per host and escalate risk/next_steps
+    for Windows-specific services when a Windows OS is confirmed.
+
+    nmap -O populates <os><osmatch name="Windows ..."> in XML; our parser stores
+    this in host["os"] as a plain string (populated by _run_nmap when present).
+    If no OS data is available the function is a no-op.
+    """
+    for host in scan_result.get("hosts", []):
+        os_str = (host.get("os") or "").lower()
+        if "windows" not in os_str:
+            continue
+
+        print(f"[*] OS correlation: Windows detected on {host.get('ip')} — "
+              f"escalating SMB/RDP risk.")
+
+        for port in host.get("ports", []):
+            if port.get("state") != "open":
+                continue
+            service = (port.get("service") or "").lower()
+            if service in _WINDOWS_ESCALATE:
+                escalation = _WINDOWS_ESCALATE[service]
+                port["risk"]       = escalation["risk"]
+                port["os_note"]    = escalation["os_note"]
+                port["next_steps"] = (
+                    escalation["prepend_steps"] + port.get("next_steps", [])
+                )
+                print(f"    [os-correlation] {service} → risk elevated to "
+                      f"{escalation['risk']}")
+
+    return scan_result
+
+
+# ── Exploit chaining (FIX I5) ─────────────────────────────────────────────────
+
+# Maps (service_a, service_b) → pivot description.
+# service_a is the foothold; service_b is the escalation target.
+_CHAIN_PIVOTS: Dict[tuple, str] = {
+    ("ftp",          "ssh"):           "FTP creds often reused → try on SSH",
+    ("ftp",          "smb"):           "FTP write access → plant payload for SMB pickup",
+    ("http",         "mysql"):         "Web app may expose DB creds in config files",
+    ("http",         "postgresql"):    "Web app may expose DB creds in config files",
+    ("http",         "redis"):         "SSRF via web app → hit Redis on loopback",
+    ("https",        "mysql"):         "Web app may expose DB creds in config files",
+    ("https",        "redis"):         "SSRF via web app → hit Redis on loopback",
+    ("smtp",         "ssh"):           "SMTP user enumeration reveals valid usernames → SSH brute",
+    ("ssh",          "mysql"):         "SSH access → read /etc/mysql or .my.cnf for DB creds",
+    ("ssh",          "redis"):         "SSH access → write authorized_keys via Redis CONFIG SET",
+    ("mysql",        "ssh"):           "MySQL UDF → OS command execution → SSH persistence",
+    ("postgresql",   "ssh"):           "PostgreSQL COPY TO/FROM PROGRAM → OS command execution",
+    ("redis",        "ssh"):           "Redis CONFIG SET dir/dbfilename → write authorized_keys",
+    ("mongodb",      "ssh"):           "MongoDB data exfil may contain SSH keys or secrets",
+    ("elasticsearch","ssh"):           "Elasticsearch Groovy script RCE → shell → SSH persistence",
+    ("smb",          "rdp"):           "SMB credential dump → reuse on RDP",
+    ("rdp",          "smb"):           "RDP session → access SMB shares directly",
+    ("snmp",         "ssh"):           "SNMP OID walk may leak SSH host keys or credentials",
+    ("ldap",         "smb"):           "LDAP user enumeration → targeted SMB credential attacks",
+    ("ldap",         "rdp"):           "LDAP user enumeration → targeted RDP brute-force",
+    ("vnc",          "ssh"):           "VNC screen access → harvest SSH keys from filesystem",
+    ("http-proxy",   "redis"):         "Open proxy → SSRF into internal Redis",
+    ("http-proxy",   "elasticsearch"): "Open proxy → SSRF into internal Elasticsearch",
+    ("socks5",       "mysql"):         "Unauthenticated SOCKS5 → tunnel into internal MySQL",
+    ("socks5",       "postgresql"):    "Unauthenticated SOCKS5 → tunnel into internal PostgreSQL",
+}
+
+
+def build_exploit_chain(scan_result: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    FIX I5 — for each host, construct a prioritised chain_of_attack list.
+
+    The chain describes how an attacker would move from the highest-risk
+    open service to subsequent services using known pivot techniques.
+    Stored as host["chain_of_attack"] = [{"step": N, "from": svc, "to": svc, "pivot": desc}].
+    """
+    for host in scan_result.get("hosts", []):
+        open_ports = [
+            p for p in host.get("ports", []) if p.get("state") == "open"
+        ]
+        if not open_ports:
+            continue
+
+        # Sort by risk so the chain starts at the highest-risk foothold
+        sorted_ports = sorted(
+            open_ports,
+            key=lambda p: (RISK_ORDER.get(p.get("risk", "unknown"), 4),
+                           str(p.get("port", "")).zfill(5)),
+        )
+
+        services = [
+            (p.get("service") or "").lower().strip()
+            for p in sorted_ports
+            if (p.get("service") or "").strip()
+        ]
+
+        chain: List[Dict[str, Any]] = []
+        step = 1
+
+        for i, svc_a in enumerate(services):
+            for svc_b in services[i + 1:]:
+                pivot = _CHAIN_PIVOTS.get((svc_a, svc_b))
+                if pivot:
+                    chain.append({
+                        "step":  step,
+                        "from":  svc_a,
+                        "to":    svc_b,
+                        "pivot": pivot,
+                    })
+                    step += 1
+
+        if chain:
+            host["chain_of_attack"] = chain
+            print(f"\n[EXPLOIT CHAIN] {host.get('ip')} — "
+                  f"{len(chain)} pivot(s) identified:")
+            for link in chain:
+                print(f"  Step {link['step']:2d}: {link['from']} → {link['to']}")
+                print(f"            {link['pivot']}")
+        else:
+            print(f"\n[EXPLOIT CHAIN] {host.get('ip')} — "
+                  "no known pivot combinations found.")
 
     return scan_result
 
@@ -855,12 +975,6 @@ def apply_fingerprinting(scan_result: Dict[str, Any]) -> Dict[str, Any]:
 def enrich_results(scan_result: Dict[str, Any]) -> Dict[str, Any]:
     """
     Attach risk/notes/next_steps/cve_hint per port, then sort ports by risk.
-
-    FIX B1: Filtered/closed ports are skipped immediately — they get
-    risk="none" and empty next_steps so they never appear exploitable.
-    FIX B5: RISK_ORDER includes "none" so they sort to the bottom.
-    FIX F4: Called a second time after fingerprinting so newly classified
-            services get correct intel entries.
     """
     if "hosts" not in scan_result:
         return scan_result
@@ -868,7 +982,6 @@ def enrich_results(scan_result: Dict[str, Any]) -> Dict[str, Any]:
     for host in scan_result["hosts"]:
         for port in host.get("ports", []):
 
-            # FIX B1 — skip risk scoring for any port that is not open
             if port.get("state") != "open":
                 port["risk"]       = "none"
                 port["notes"]      = (
@@ -899,7 +1012,6 @@ def enrich_results(scan_result: Dict[str, Any]) -> Dict[str, Any]:
             if version and service:
                 port["cve_hint"] = f"Search: {service} {version} exploit CVE"
 
-        # FIX R3 + B5 — sort: critical → high → medium → low → unknown → none
         host["ports"].sort(
             key=lambda p: (
                 RISK_ORDER.get(p.get("risk", "unknown"), 4),
@@ -910,59 +1022,43 @@ def enrich_results(scan_result: Dict[str, Any]) -> Dict[str, Any]:
     return scan_result
 
 
-# ── Banner grabbing (FIX T3) ──────────────────────────────────────────────────
+# ── Banner grabbing ───────────────────────────────────────────────────────────
 
-# FIX H3: per-port banner timeout — slow/handshaking services get more time.
-# Default is 2.0 s; overrides listed here are applied in banner_grab().
 _BANNER_TIMEOUTS: Dict[int, float] = {
-    25:    4.0,   # SMTP — often slow to greet
-    110:   3.5,   # POP3
-    143:   3.5,   # IMAP
-    587:   4.0,   # Submission
-    3306:  3.0,   # MySQL
-    5432:  3.0,   # PostgreSQL
-    6379:  2.5,   # Redis
-    27017: 3.0,   # MongoDB
-    9200:  3.0,   # Elasticsearch
+    25:    4.0,
+    110:   3.5,
+    143:   3.5,
+    587:   4.0,
+    3306:  3.0,
+    5432:  3.0,
+    6379:  2.5,
+    27017: 3.0,
+    9200:  3.0,
 }
 
-# FIX G3: port-specific probe payloads — sending an HTTP HEAD to Redis or MySQL
-# gets no response; tailoring the probe makes silent services speak.
 _BANNER_PROBES: Dict[int, bytes] = {
-    22:    b"",                          # SSH sends banner immediately on connect
-    6379:  b"PING\r\n",                 # Redis: expects "+PONG"
-    3306:  b"",                          # MySQL sends greeting on connect
-    5432:  b"",                          # PostgreSQL sends greeting on connect
-    27017: b"",                          # MongoDB sends greeting on connect
-    9200:  b"GET / HTTP/1.0\r\n\r\n",  # Elasticsearch: REST over HTTP
+    22:    b"",
+    6379:  b"PING\r\n",
+    3306:  b"",
+    5432:  b"",
+    27017: b"",
+    9200:  b"GET / HTTP/1.0\r\n\r\n",
 }
 _HTTP_PROBE = b"HEAD / HTTP/1.0\r\nHost: localhost\r\n\r\n"
 
 
 def banner_grab(host: str, port: int, timeout: Optional[float] = None) -> Optional[str]:
-    """
-    FIX T3 — attempt a raw TCP connection and read up to 256 bytes.
-    FIX G3 — send a port-appropriate probe so non-HTTP services respond:
-              - SSH / MySQL / PostgreSQL / MongoDB: read immediately (they speak first).
-              - Redis: send PING, read +PONG.
-              - Elasticsearch: send HTTP GET.
-              - Everything else: send HTTP HEAD.
-    Returns the decoded banner string, or None on failure.
-    """
-    # FIX H3: use per-port timeout; caller may still override
     effective_timeout = timeout if timeout is not None else _BANNER_TIMEOUTS.get(port, 2.0)
     probe = _BANNER_PROBES.get(port, _HTTP_PROBE)
     try:
         with socket.create_connection((host, port), timeout=effective_timeout) as s:
             if probe:
                 s.sendall(probe)
-            # Give the service up to timeout seconds to respond
             data = b""
             try:
                 data = s.recv(256)
             except OSError:
                 pass
-            # If we got nothing and haven't tried a probe yet, fall back to newline
             if not data and not probe:
                 try:
                     s.sendall(b"\n")
@@ -975,75 +1071,78 @@ def banner_grab(host: str, port: int, timeout: Optional[float] = None) -> Option
         return None
 
 
+def _grab_one_port(ip_str: str, port: Dict[str, Any]) -> None:
+    """
+    FIX I3: single-port banner-grab task, safe to run in a thread pool.
+    Mutates the port dict in-place (same object as in the host list).
+    """
+    port["_host"] = ip_str
+    has_service = port.get("service") and port["service"] not in ("unknown", None)
+    has_version = bool(port.get("version"))
+    if has_service and has_version:
+        return
+    if port.get("banner"):
+        return
+
+    port_num = port.get("port")
+    if not port_num:
+        return
+
+    print(f"[*] Banner grab: {ip_str}:{port_num}")
+    banner = banner_grab(ip_str, int(port_num))
+    if banner:
+        port["banner"] = banner
+        print(f"    → {banner[:80]!r}")
+    else:
+        print(f"    → no banner")
+
+
 def banner_grab_scan(scan_result: Dict[str, Any]) -> Dict[str, Any]:
     """
-    FIX T3 — iterate over open ports and attempt a banner grab when useful.
-    FIX F3 — trigger condition fixed: grabs banner when service is unidentified
-              OR when version is missing, so services like upnp/ftp-proxy that
-              nmap names but cannot version-detect also get a probe.
-    Only runs against loopback / private IPs (safe to probe without --force).
+    FIX T3 / FIX I3 — concurrent banner grabbing for loopback / private IPs.
     """
+    tasks: List[tuple] = []
+
     for host in scan_result.get("hosts", []):
         ip_str = host.get("ip", "")
         try:
             ip = ipaddress.ip_address(ip_str)
             if not (ip.is_loopback or ip.is_private):
-                continue    # skip remote hosts — banner grabbing needs --force intent
+                continue
         except ValueError:
             continue
 
         for port in host.get("ports", []):
             if port.get("state") != "open":
                 continue
+            tasks.append((ip_str, port))
 
-            # FIX H2: stash host IP so fingerprint_service can attempt TLS probe
-            port["_host"] = ip_str
-
-            # FIX F3: grab when service is unknown OR version is absent
-            has_service = port.get("service") and port["service"] not in ("unknown", None)
-            has_version = bool(port.get("version"))
-            if has_service and has_version:
-                continue    # nmap fully identified it — skip
-            if port.get("banner"):
-                continue    # already grabbed
-
-            port_num = port.get("port")
-            if not port_num:
-                continue
-
-            print(f"[*] Banner grab: {ip_str}:{port_num}")
-            banner = banner_grab(ip_str, int(port_num))
-            if banner:
-                port["banner"] = banner
-                print(f"    → {banner[:80]!r}")
-            else:
-                print(f"    → no banner")
+    if tasks:
+        print(f"[*] Banner grabbing {len(tasks)} port(s) concurrently "
+              f"(workers={BANNER_WORKERS})...")
+        with ThreadPoolExecutor(max_workers=BANNER_WORKERS) as ex:
+            futures = [ex.submit(_grab_one_port, ip, p) for ip, p in tasks]
+            for f in as_completed(futures):
+                try:
+                    f.result()
+                except Exception as exc:
+                    print(f"[!] Banner grab task failed: {exc}", file=sys.stderr)
 
     return scan_result
 
 
 def _open_ports_only(scan_result: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    FIX R4 — strip closed/filtered ports before sending to the AI.
-    FIX P1 — skip hosts that have no open ports entirely so the AI
-              is not given useless empty host objects.
-    Returns a shallow copy with only reachable hosts and their open ports.
-    """
     result = dict(scan_result)
     result["hosts"] = []
     for host in scan_result.get("hosts", []):
         h = dict(host)
         h["ports"] = [p for p in host.get("ports", []) if p.get("state") == "open"]
-        if h["ports"]:                   # FIX P1: drop hosts with nothing open
+        if h["ports"]:
             result["hosts"].append(h)
     return result
 
 
 def print_exposure_summary(res: Dict[str, Any]) -> None:
-    """
-    FIX B4 — print a human-readable exposure summary per host after enrichment.
-    Shows open port count broken down by risk level.
-    """
     for host in res.get("hosts", []):
         open_ports = [p for p in host.get("ports", []) if p.get("state") == "open"]
         if not open_ports:
@@ -1066,7 +1165,6 @@ def print_exposure_summary(res: Dict[str, Any]) -> None:
 # ── Audit log ─────────────────────────────────────────────────────────────────
 
 def audit_log(target: str, result: Dict[str, Any]) -> None:
-    """Append one JSONL entry per scan to scan_audit.log."""
     entry = {
         "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
         "target":    target,
@@ -1083,10 +1181,6 @@ def audit_log(target: str, result: Dict[str, Any]) -> None:
 # ── Target validation ─────────────────────────────────────────────────────────
 
 def _resolve_to_ip(target: str) -> Optional[str]:
-    """
-    FIX V2 — resolve hostname to IP using getaddrinfo (supports IPv4 + IPv6).
-    Returns the first resolved address as a string.
-    """
     try:
         results = socket.getaddrinfo(target, None)
         if results:
@@ -1097,20 +1191,10 @@ def _resolve_to_ip(target: str) -> Optional[str]:
 
 
 def _is_remote(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-    """
-    FIX R2 — a host is 'remote' (requires --force) only if it is BOTH
-    not loopback AND not private. LAN addresses are allowed by default.
-    """
     return not ip.is_loopback and not ip.is_private
 
 
 def target_allowed(target: str, force: bool = False) -> bool:
-    """
-    Three-step guard:
-      1. Format check  — blocks injection characters.
-      2. CIDR check    — single hosts only.
-      3. Scope check   — resolves hostname, rejects non-private unless --force.
-    """
     if not _SAFE_TARGET_RE.match(target):
         print(f"[!] Target '{target}' failed format validation (possible injection).")
         return False
@@ -1161,34 +1245,21 @@ def validate_ports(ports: Optional[str]) -> Optional[str]:
     return None
 
 
-# ── Prompt-level port override (FIX B3) ──────────────────────────────────────
-
-# Matches: "top 10 ports", "top-20 port", "top 100 ports", etc.
 _TOP_N_RE = re.compile(r'\btop[\s\-]?(\d+)\s+ports?\b', re.IGNORECASE)
 
 
 def extract_prompt_port_override(prompt: str) -> Optional[str]:
-    """
-    FIX B3 — detect 'top N ports' in the user prompt and return the
-    appropriate nmap port spec. Returns None when no override is needed.
-
-    Nmap's --top-ports flag is used for values ≤ 1000; for larger values
-    we fall back to None (nmap default top-1000) since --top-ports has
-    an upper bound in practice.
-    """
     m = _TOP_N_RE.search(prompt)
     if not m:
-        return "NONE"          # sentinel: no override found
+        return "NONE"
 
     n = int(m.group(1))
     if n <= 1000:
-        # Return a special token; we handle --top-ports in run_nmap_direct
         override = f"__top_{n}__"
         print(f"[*] Prompt override: 'top {n} ports' detected — "
               f"will use nmap --top-ports {n}.")
         return override
 
-    # n > 1000 — nmap doesn't support --top-ports that high, use default
     print(f"[*] Prompt override: 'top {n} ports' detected — "
           f"n > 1000, using nmap default top-1000.")
     return None
@@ -1197,10 +1268,6 @@ def extract_prompt_port_override(prompt: str) -> Optional[str]:
 # ── Flag helpers ──────────────────────────────────────────────────────────────
 
 def sanitise_flags(flags: Optional[str]) -> str:
-    """
-    Whitelist enforced; -T5 clamped to -T4; -sA replaced with -sS.
-    FIX V1: --min-rate N is now a two-token flag — handled as a pair.
-    """
     if not flags:
         print(f"[*] No flags from model — using defaults: {DEFAULT_FLAGS}")
         return DEFAULT_FLAGS
@@ -1216,7 +1283,6 @@ def sanitise_flags(flags: Optional[str]) -> str:
     while i < len(tokens):
         tok = tokens[i]
 
-        # FIX V1: --min-rate requires a numeric argument immediately after it
         if tok == "--min-rate":
             if i + 1 < len(tokens) and re.fullmatch(r'\d+', tokens[i + 1]):
                 safe.append("--min-rate")
@@ -1257,7 +1323,8 @@ def sanitise_flags(flags: Optional[str]) -> str:
 def _run_nmap(cmd: list[str], timeout: int = SCAN_TIMEOUT) -> Dict[str, Any]:
     """
     Execute nmap with -oX and parse XML.
-    Returns {"timed_out": True} on timeout so the caller can retry (FIX V3).
+    FIX I4: also extracts OS detection data from <os><osmatch> elements
+    and stores it as host["os"] = "<best match name>" for correlation.
     """
     print("[*] Running:", " ".join(shlex.quote(c) for c in cmd))
     try:
@@ -1272,7 +1339,7 @@ def _run_nmap(cmd: list[str], timeout: int = SCAN_TIMEOUT) -> Dict[str, Any]:
         return {"error": proc.stderr.strip() or "nmap returned non-zero exit code"}
 
     if len(proc.stdout.encode()) > MAX_XML_BYTES:
-        return {"error": f"nmap output exceeded {MAX_XML_BYTES // (1024*1024)} MB — parse aborted"}
+        return {"error": f"nmap output exceeded {MAX_XML_BYTES // (1024*1024)} MB"}
 
     try:
         import xml.etree.ElementTree as ET
@@ -1282,6 +1349,15 @@ def _run_nmap(cmd: list[str], timeout: int = SCAN_TIMEOUT) -> Dict[str, Any]:
             addr   = host.find("address")
             ipaddr = addr.get("addr") if addr is not None else None
             hostdict: Dict[str, Any] = {"ip": ipaddr, "ports": []}
+
+            # FIX I4: extract best OS match name
+            os_el = host.find("os")
+            if os_el is not None:
+                matches = os_el.findall("osmatch")
+                if matches:
+                    # osmatch elements are ordered best-match first by nmap
+                    hostdict["os"] = matches[0].get("name", "")
+
             ports_el = host.find("ports")
             if ports_el is None:
                 hosts.append(hostdict)
@@ -1314,17 +1390,11 @@ def run_nmap_direct(
     flags: Optional[str],
     retry_on_timeout: bool = True,
 ) -> Dict[str, Any]:
-    """
-    2-stage smart scan (discovery → version detection on open ports).
-    FIX V3: retries with top-1000 ports on timeout.
-    FIX B3: handles __top_N__ sentinel from prompt port override.
-    """
-    # FIX B3: handle __top_N__ sentinel — convert to nmap --top-ports flag
     top_ports_flag: Optional[str] = None
     if isinstance(ports, str) and ports.startswith("__top_") and ports.endswith("__"):
         n = ports[6:-2]
         top_ports_flag = n
-        ports = None    # clear so validate_ports doesn't trip on it
+        ports = None
         print(f"[*] Using --top-ports {n} from prompt override.")
 
     ports = validate_ports(normalise_ports(ports))
@@ -1356,7 +1426,6 @@ def run_nmap_direct(
         t0 = time.monotonic()
         stage1 = _run_nmap(cmd1, timeout=_scan_timeout(target))
 
-        # FIX V3: retry on timeout with top-1000 ports
         if stage1.get("timed_out") and retry_on_timeout and (ports or top_ports_flag):
             print("[!] Stage 1 timed out — retrying with top 1000 ports...")
             cmd1_retry = _build_disc_cmd(None, top_n=None)
@@ -1365,7 +1434,7 @@ def run_nmap_direct(
         if "error" in stage1:
             return stage1
 
-        open_ports = list(dict.fromkeys(   # FIX P2: deduplicate, preserve order
+        open_ports = list(dict.fromkeys(
             p["port"]
             for h in stage1.get("hosts", [])
             for p in h.get("ports", [])
@@ -1390,7 +1459,6 @@ def run_nmap_direct(
         cmd2 = ["nmap", "-oX", "-"] + base + ["-sV", "-p", ",".join(open_ports), target]
         result = _run_nmap(cmd2, timeout=_scan_timeout(target))
 
-        # FIX T2: on timeout, retry with --version-light before giving up
         if result.get("timed_out") and retry_on_timeout:
             print("[!] Stage 2 timed out — retrying with --version-light...")
             cmd2_light = (
@@ -1403,7 +1471,7 @@ def run_nmap_direct(
                 result = stage1
 
         elapsed = time.monotonic() - t0
-        print(f"[*] Scan completed in {elapsed:.2f}s")  # FIX R5
+        print(f"[*] Scan completed in {elapsed:.2f}s")
         return result
 
     # ── Single-stage scan ──────────────────────────────────────────────────
@@ -1421,7 +1489,6 @@ def run_nmap_direct(
 
     result = _run_nmap(cmd, timeout=_scan_timeout(target))
 
-    # FIX V3: retry single-stage on timeout
     if result.get("timed_out") and retry_on_timeout and (ports or top_ports_flag):
         print("[!] Scan timed out — retrying with top 1000 ports...")
         cmd_retry = ["nmap", "-oX", "-"]
@@ -1433,7 +1500,7 @@ def run_nmap_direct(
         result = _run_nmap(cmd_retry, timeout=_scan_timeout(target))
 
     elapsed = time.monotonic() - t0
-    print(f"[*] Scan completed in {elapsed:.2f}s")  # FIX R5
+    print(f"[*] Scan completed in {elapsed:.2f}s")
     return result
 
 
@@ -1553,9 +1620,6 @@ def ask_model_for_action(user_prompt: str, model_name: str) -> Dict[str, Any]:
 
 
 def ai_followup(result: Dict[str, Any], model_name: str) -> None:
-    """
-    FIX R4 — pass only open ports to the model to reduce noise and tokens.
-    """
     print("\n[*] Requesting AI follow-up analysis (open ports only)...")
     filtered = _open_ports_only(result)
     try:
@@ -1564,8 +1628,9 @@ def ai_followup(result: Dict[str, Any], model_name: str) -> None:
             messages=[{
                 "role": "user",
                 "content": (
-                    "Given the following network scan result, suggest concrete "
-                    "attack paths and prioritised next steps for a penetration tester:\n\n"
+                    "Given the following network scan result (including any exploit chain), "
+                    "suggest concrete attack paths and prioritised next steps for a "
+                    "penetration tester:\n\n"
                     + json.dumps(filtered, indent=2)
                 ),
             }],
@@ -1578,16 +1643,16 @@ def ai_followup(result: Dict[str, Any], model_name: str) -> None:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
-    _load_external_intel()  # FIX V4: merge external intel before scanning
+    _load_external_intel()
 
-    parser = argparse.ArgumentParser(description="Ollama-driven Nmap agent (v8).")
+    parser = argparse.ArgumentParser(description="Ollama-driven Nmap agent (v11).")
     parser.add_argument("--model",       default="dolphin-llama3:8b")
     parser.add_argument("--prompt",      help="Prompt (omit for interactive mode).")
     parser.add_argument("--yes",         action="store_true", help="Auto-confirm scans.")
     parser.add_argument("--force",       action="store_true", help="Allow non-private targets.")
     parser.add_argument("--no-intel",    action="store_true", help="Skip enrichment layer.")
     parser.add_argument("--banner",      action="store_true",
-                        help="FIX T3: banner-grab open ports with no nmap service ID.")
+                        help="Banner-grab open ports with no nmap service ID.")
     parser.add_argument("--ai-followup", action="store_true",
                         help="Ask the model to analyse enriched results.")
     parser.add_argument(
@@ -1599,7 +1664,7 @@ def main():
     parser.add_argument(
         "--fast",
         action="store_true",
-        help="FIX V1: append --min-rate 1000 for faster scans.",
+        help="Append --min-rate 1000 for faster scans.",
     )
     args = parser.parse_args()
 
@@ -1617,8 +1682,6 @@ def main():
             print("No prompt given.")
             sys.exit(0)
 
-    # FIX B3 — extract 'top N ports' from prompt before asking the model
-    # so the model cannot override it with a full port range like "1-65535"
     prompt_port_override = extract_prompt_port_override(user_prompt)
 
     # ── Parse model action ────────────────────────────────────────────────────
@@ -1645,34 +1708,28 @@ def main():
     target = (action.get("target") or "").strip()
     flags  = action.get("flags")
 
-    # FIX B3 — apply prompt-level port override; "NONE" means no override found
     if prompt_port_override == "NONE":
-        ports = action.get("ports")   # use whatever the model chose
+        ports = action.get("ports")
     else:
-        ports = prompt_port_override  # prompt wins over model
+        ports = prompt_port_override
         print(f"[*] Port override applied from prompt: {ports!r}")
 
     if not target:
         print("No target from model.")
         sys.exit(1)
 
-    # ── Validate target ───────────────────────────────────────────────────────
     if not target_allowed(target, force=args.force):
         print(f"[!] Refusing to scan '{target}'. Use --force to override.")
         sys.exit(1)
 
-    # FIX R1: merge model flags with operator profile
     flags = apply_profile(flags, args.profile)
 
-    # FIX V1: --fast appends --min-rate 1000
     if args.fast:
         flags = flags + " --min-rate 1000"
         print(f"[*] --fast enabled: appended '--min-rate 1000'. Flags: {flags}")
 
-    # Sanitise after profile + fast merge
     flags = sanitise_flags(flags)
 
-    # ── Confirm ───────────────────────────────────────────────────────────────
     if not args.yes:
         print(f"\nAbout to scan: target={target}  ports={ports}  flags={flags}")
         print("Type 'yes' to continue:")
@@ -1680,7 +1737,7 @@ def main():
             print("Aborted.")
             sys.exit(0)
 
-    # ── Run scan (try llm-tools first, fall back to direct) ───────────────────
+    # ── Run scan ──────────────────────────────────────────────────────────────
     if _llm_tools is not None:
         try:
             print("[*] Trying llm-tools-nmap integration...")
@@ -1696,28 +1753,35 @@ def main():
     # ── Post-scan pipeline ────────────────────────────────────────────────────
     if not args.no_intel:
 
-        # Step 1 — Initial enrichment pass (nmap-detected services)
+        # Step 1 — Initial enrichment
         res = enrich_results(res)
 
-        # Step 2 — Banner grabbing (FIX T3 + FIX F3: extended trigger condition)
         if args.banner and "error" not in res:
+            # Step 2 — Concurrent banner grabbing
             print("\n[*] Banner grabbing services without full identification...")
             res = banner_grab_scan(res)
 
-            # Step 3 — Fingerprinting (FIX F1): classify services from banners
+            # Step 3 — Concurrent fingerprinting
             print("\n[*] Applying service fingerprinting engine...")
             res = apply_fingerprinting(res)
 
-            # Step 4 — Re-enrich (FIX F4): newly fingerprinted services get intel
+            # Step 4 — Re-enrich after fingerprinting
             print("\n[*] Re-enriching after fingerprinting...")
             res = enrich_results(res)
 
-        # Step 5 — Human-readable exposure summary
+        # Step 5 — OS fingerprint correlation (FIX I4)
+        print("\n[*] Applying OS fingerprint correlation...")
+        res = apply_os_correlation(res)
+
+        # Step 6 — Exploit chain construction (FIX I5)
+        print("\n[*] Building exploit chain...")
+        res = build_exploit_chain(res)
+
+        # Step 7 — Human-readable exposure summary
         print_exposure_summary(res)
         print("\n[*] Enriched result:")
 
     else:
-        # --no-intel: banner + fingerprint still available but no enrichment
         if args.banner and "error" not in res:
             print("\n[*] Banner grabbing services without full identification...")
             res = banner_grab_scan(res)
@@ -1727,10 +1791,8 @@ def main():
 
     print(json.dumps(res, indent=2))
 
-    # ── Audit log ─────────────────────────────────────────────────────────────
     audit_log(target, res)
 
-    # ── AI follow-up ──────────────────────────────────────────────────────────
     if args.ai_followup and "error" not in res:
         ai_followup(res, model_name=args.model)
 
