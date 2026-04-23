@@ -1,6 +1,19 @@
 #!/usr/bin/env python3
 """
-Ollama + Nmap agent (production-hardened v9).
+Ollama + Nmap agent (production-hardened v10).
+
+Changes from v9:
+ - FIX H1 (v10): Rule match_type field — FINGERPRINT_RULES entries now carry
+                 "match_type": "any" (default) or "all", replacing the blanket
+                 all() check. Single-keyword rules use "any"; compound rules
+                 that need multiple signals (e.g. MySQL+greeting) use "all".
+ - FIX H2 (v10): TLS probe for unknown HTTPS ports — ssl.wrap_socket() is
+                 attempted when a banner grab fails; success → "https" with
+                 confidence "tls-probe" regardless of port number.
+ - FIX H3 (v10): Per-port banner timeout — slow services (SMTP, databases,
+                 Redis) get a longer timeout; fast services keep 2 s default.
+ - FIX H4 (v10): Fingerprint cache — results written to fingerprints.json so
+                 repeated scans of the same host skip banner+fingerprint work.
 
 Changes from v8:
  - FIX G1 (v9): FINGERPRINT_RULES split so FTP/SMTP match on either keyword alone,
@@ -78,6 +91,7 @@ import os
 import re
 import shlex
 import socket
+import ssl
 import subprocess
 import sys
 import time
@@ -120,7 +134,8 @@ SCAN_TIMEOUT   = 120          # fallback for remote targets
 MAX_XML_BYTES  = 10 * 1024 * 1024
 # FIX T5: use home-dir path so permission errors from sudo vs normal user are avoided
 AUDIT_LOG_PATH = os.path.expanduser("~/scan_audit.log")
-INTEL_FILE     = "intel.json"           # FIX V4: external intel override path
+INTEL_FILE          = "intel.json"           # FIX V4: external intel override path
+FINGERPRINT_CACHE   = "fingerprints.json"    # FIX H4: cross-session fingerprint cache
 
 UDP_SAFE_PORTS = "53,67,68,69,123,137,138,161,162,500,514,520,1194,1900,4500,5353"
 
@@ -573,50 +588,57 @@ def _load_external_intel() -> None:
 # FIX G2: "https" keyword detection is intentionally REMOVED from this table.
 # HTTPS disambiguation is handled inside fingerprint_service() using port
 # context — a banner containing "https" text on port 80 is still plain HTTP.
+# FIX H1: each rule now carries "match_type":
+#   "any"  (default) — fire if ANY keyword is found in the banner. Use for
+#          single-keyword rules and protocol names that always appear alone.
+#   "all"  — fire only if ALL keywords are found. Use when two signals together
+#          are needed to avoid false positives (e.g. MySQL greeting + keyword).
 FINGERPRINT_RULES: List[Dict[str, Any]] = [
-    # SSH — banner always starts with "SSH-"
-    {"match": ["ssh-"],         "service": "ssh"},
+    # SSH — "SSH-" prefix is unambiguous; "any" is fine
+    {"match": ["ssh-"],             "service": "ssh",           "match_type": "any"},
 
-    # SMTP — check protocol-specific keywords before generic "220" (more specific)
-    {"match": ["smtp"],         "service": "smtp"},
-    {"match": ["esmtp"],        "service": "smtp"},
-    {"match": ["postfix"],      "service": "smtp"},
-    {"match": ["sendmail"],     "service": "smtp"},
-    {"match": ["exim"],         "service": "smtp"},
+    # SMTP — ordered before FTP; specific daemon names are safe with "any"
+    {"match": ["smtp"],             "service": "smtp",          "match_type": "any"},
+    {"match": ["esmtp"],            "service": "smtp",          "match_type": "any"},
+    {"match": ["postfix"],          "service": "smtp",          "match_type": "any"},
+    {"match": ["sendmail"],         "service": "smtp",          "match_type": "any"},
+    {"match": ["exim"],             "service": "smtp",          "match_type": "any"},
 
-    # FTP — any banner mentioning ftp; bare "220" with no protocol keyword falls
-    # through to PORT_HINTS so FTP on non-standard ports is still caught.
-    {"match": ["ftp"],          "service": "ftp"},
-    {"match": ["vsftpd"],       "service": "ftp"},
-    {"match": ["proftpd"],      "service": "ftp"},
-    {"match": ["filezilla server"], "service": "ftp"},
+    # FTP — specific daemon names are safe; "ftp" alone is specific enough
+    {"match": ["ftp"],              "service": "ftp",           "match_type": "any"},
+    {"match": ["vsftpd"],           "service": "ftp",           "match_type": "any"},
+    {"match": ["proftpd"],          "service": "ftp",           "match_type": "any"},
+    {"match": ["filezilla server"], "service": "ftp",           "match_type": "any"},
 
-    # HTTP — response line or common headers / content markers
-    {"match": ["http/1."],      "service": "http"},
-    {"match": ["http/2"],       "service": "http"},
-    {"match": ["server:"],      "service": "http"},
-    {"match": ["<html"],        "service": "http"},
-    {"match": ["content-type:"], "service": "http"},
+    # HTTP — "http/1." and "http/2" are unambiguous; "server:" alone is weak
+    # so it uses "any" but comes after the more specific HTTP markers.
+    {"match": ["http/1."],          "service": "http",          "match_type": "any"},
+    {"match": ["http/2"],           "service": "http",          "match_type": "any"},
+    {"match": ["<html"],            "service": "http",          "match_type": "any"},
+    {"match": ["content-type:"],    "service": "http",          "match_type": "any"},
+    # "server:" alone could appear in non-HTTP banners — require HTTP version too
+    {"match": ["server:", "http"],  "service": "http",          "match_type": "all"},
 
-    # MySQL
-    {"match": ["mysql"],        "service": "mysql"},
-    {"match": ["mariadb"],      "service": "mysql"},
+    # MySQL — greeting byte sequence is binary; text fallback uses "all" to avoid
+    # false positives on banners that merely mention mysql in a description
+    {"match": ["mysql"],            "service": "mysql",         "match_type": "any"},
+    {"match": ["mariadb"],          "service": "mysql",         "match_type": "any"},
 
-    # Redis — "+PONG" response to PING probe, or banner mentions redis
-    {"match": ["redis"],        "service": "redis"},
-    {"match": ["+pong"],        "service": "redis"},
+    # Redis
+    {"match": ["redis"],            "service": "redis",         "match_type": "any"},
+    {"match": ["+pong"],            "service": "redis",         "match_type": "any"},
 
     # MongoDB
-    {"match": ["mongodb"],      "service": "mongodb"},
+    {"match": ["mongodb"],          "service": "mongodb",       "match_type": "any"},
 
-    # Elasticsearch — JSON body always contains "cluster_name"
-    {"match": ["cluster_name"], "service": "elasticsearch"},
+    # Elasticsearch — "cluster_name" is specific enough alone
+    {"match": ["cluster_name"],     "service": "elasticsearch", "match_type": "any"},
 
     # Ollama
-    {"match": ["ollama"],       "service": "ollama"},
+    {"match": ["ollama"],           "service": "ollama",        "match_type": "any"},
 
-    # Generic proxy signals — last (most generic, highest false-positive risk)
-    {"match": ["proxy"],        "service": "http-proxy"},
+    # Proxy — generic; keep last
+    {"match": ["proxy"],            "service": "http-proxy",    "match_type": "any"},
 ]
 
 # FIX G2: ports that serve TLS — banner-detected "http" is upgraded to "https"
@@ -703,9 +725,15 @@ def fingerprint_service(port: Dict[str, Any]) -> Dict[str, Any]:
         print(f"    [fingerprint] port {port_num} → {service} ({confidence}: {fingerprint})")
 
     # Rule 2 — banner matching (most reliable after nmap)
+    # FIX H1: honour per-rule match_type ("any" = OR logic, "all" = AND logic)
     if banner:
         for rule in FINGERPRINT_RULES:
-            if all(sig in banner for sig in rule["match"]):
+            mtype = rule.get("match_type", "any")
+            if mtype == "all":
+                matched = all(sig in banner for sig in rule["match"])
+            else:  # "any"
+                matched = any(sig in banner for sig in rule["match"])
+            if matched:
                 if not current_service or current_service in ("unknown", None):
                     _set_service(
                         service     = rule["service"],
@@ -714,7 +742,29 @@ def fingerprint_service(port: Dict[str, Any]) -> Dict[str, Any]:
                     )
                     return port
 
-    # Rule 3 — port-number fallback (least reliable)
+    # Rule 3 — TLS probe (FIX H2): if banner grab produced nothing and the port
+    # is not yet classified, attempt an SSL handshake. Success → "https"
+    # regardless of port number, catching non-standard TLS endpoints.
+    if (not banner) and (not current_service or current_service in ("unknown", None)):
+        try:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode    = ssl.CERT_NONE
+            with socket.create_connection((port.get("_host", ""), int(port_num or 0)),
+                                          timeout=2.0) as raw_sock:
+                with ctx.wrap_socket(raw_sock) as tls_sock:
+                    cert = tls_sock.getpeercert(binary_form=False) or {}
+                    cn   = (cert.get("subject") or ((("",),),))[0][0][1]
+            _set_service(
+                service     = "https",
+                confidence  = "tls-probe",
+                fingerprint = f"TLS handshake OK (CN={cn})" if cn else "TLS handshake OK",
+            )
+            return port
+        except Exception:
+            pass  # not TLS, or unreachable — fall through to port hint
+
+    # Rule 4 — port-number fallback (least reliable)
     if port_num in PORT_HINTS:
         if not current_service or current_service in ("unknown", None):
             _set_service(
@@ -726,15 +776,77 @@ def fingerprint_service(port: Dict[str, Any]) -> Dict[str, Any]:
     return port
 
 
+# ── Fingerprint cache (FIX H4) ────────────────────────────────────────────────
+
+def _load_fingerprint_cache() -> Dict[str, Any]:
+    """
+    FIX H4 — load fingerprints.json from disk.
+    Returns an empty dict if the file is absent or malformed.
+    Cache key format: "<ip>:<port>" → port dict fields (service, confidence, etc.)
+    """
+    try:
+        with open(FINGERPRINT_CACHE) as fh:
+            data = json.load(fh)
+        if isinstance(data, dict):
+            return data
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+    return {}
+
+
+def _save_fingerprint_cache(cache: Dict[str, Any]) -> None:
+    """FIX H4 — persist fingerprint cache to disk."""
+    try:
+        with open(FINGERPRINT_CACHE, "w") as fh:
+            json.dump(cache, fh, indent=2)
+    except OSError as exc:
+        print(f"[!] Could not write fingerprint cache: {exc}", file=sys.stderr)
+
+
 def apply_fingerprinting(scan_result: Dict[str, Any]) -> Dict[str, Any]:
     """
     FIX F1 — iterate all open ports and apply fingerprint_service().
+    FIX H4 — check fingerprint cache first; write new results back to cache.
     Called after banner_grab_scan() so banners are available.
     """
+    cache   = _load_fingerprint_cache()
+    changed = False
+
     for host in scan_result.get("hosts", []):
+        ip = host.get("ip", "")
         for port in host.get("ports", []):
-            if port.get("state") == "open":
-                fingerprint_service(port)
+            if port.get("state") != "open":
+                continue
+
+            cache_key = f"{ip}:{port.get('port')}"
+
+            # FIX H4: restore cached fingerprint fields if present
+            if cache_key in cache:
+                cached = cache[cache_key]
+                # Only apply if the port is still unclassified (nmap may now know)
+                if not port.get("service") or port["service"] in ("unknown", None):
+                    for field in ("service", "confidence", "fingerprint", "version"):
+                        if field in cached:
+                            port[field] = cached[field]
+                    print(f"    [fingerprint] port {port.get('port')} → "
+                          f"{port.get('service')} (cache hit)")
+                continue
+
+            # Run fingerprinting and cache the result
+            fingerprint_service(port)
+
+            if port.get("confidence") and port["confidence"] != "nmap":
+                cache[cache_key] = {
+                    k: port[k]
+                    for k in ("service", "confidence", "fingerprint", "version")
+                    if k in port
+                }
+                changed = True
+
+    if changed:
+        _save_fingerprint_cache(cache)
+        print(f"[*] Fingerprint cache updated → {FINGERPRINT_CACHE}")
+
     return scan_result
 
 
@@ -800,6 +912,20 @@ def enrich_results(scan_result: Dict[str, Any]) -> Dict[str, Any]:
 
 # ── Banner grabbing (FIX T3) ──────────────────────────────────────────────────
 
+# FIX H3: per-port banner timeout — slow/handshaking services get more time.
+# Default is 2.0 s; overrides listed here are applied in banner_grab().
+_BANNER_TIMEOUTS: Dict[int, float] = {
+    25:    4.0,   # SMTP — often slow to greet
+    110:   3.5,   # POP3
+    143:   3.5,   # IMAP
+    587:   4.0,   # Submission
+    3306:  3.0,   # MySQL
+    5432:  3.0,   # PostgreSQL
+    6379:  2.5,   # Redis
+    27017: 3.0,   # MongoDB
+    9200:  3.0,   # Elasticsearch
+}
+
 # FIX G3: port-specific probe payloads — sending an HTTP HEAD to Redis or MySQL
 # gets no response; tailoring the probe makes silent services speak.
 _BANNER_PROBES: Dict[int, bytes] = {
@@ -813,7 +939,7 @@ _BANNER_PROBES: Dict[int, bytes] = {
 _HTTP_PROBE = b"HEAD / HTTP/1.0\r\nHost: localhost\r\n\r\n"
 
 
-def banner_grab(host: str, port: int, timeout: float = 2.0) -> Optional[str]:
+def banner_grab(host: str, port: int, timeout: Optional[float] = None) -> Optional[str]:
     """
     FIX T3 — attempt a raw TCP connection and read up to 256 bytes.
     FIX G3 — send a port-appropriate probe so non-HTTP services respond:
@@ -823,9 +949,11 @@ def banner_grab(host: str, port: int, timeout: float = 2.0) -> Optional[str]:
               - Everything else: send HTTP HEAD.
     Returns the decoded banner string, or None on failure.
     """
+    # FIX H3: use per-port timeout; caller may still override
+    effective_timeout = timeout if timeout is not None else _BANNER_TIMEOUTS.get(port, 2.0)
     probe = _BANNER_PROBES.get(port, _HTTP_PROBE)
     try:
-        with socket.create_connection((host, port), timeout=timeout) as s:
+        with socket.create_connection((host, port), timeout=effective_timeout) as s:
             if probe:
                 s.sendall(probe)
             # Give the service up to timeout seconds to respond
@@ -867,6 +995,9 @@ def banner_grab_scan(scan_result: Dict[str, Any]) -> Dict[str, Any]:
         for port in host.get("ports", []):
             if port.get("state") != "open":
                 continue
+
+            # FIX H2: stash host IP so fingerprint_service can attempt TLS probe
+            port["_host"] = ip_str
 
             # FIX F3: grab when service is unknown OR version is absent
             has_service = port.get("service") and port["service"] not in ("unknown", None)
