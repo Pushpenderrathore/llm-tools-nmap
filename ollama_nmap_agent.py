@@ -77,6 +77,7 @@ import time
 import importlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, Iterable, List, Optional
+from validation_engine_v1 import run_validation_pipeline
 
 try:
     import ollama
